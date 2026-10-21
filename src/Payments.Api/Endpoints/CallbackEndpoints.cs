@@ -21,6 +21,7 @@ public static class CallbackEndpoints
     {
         if (!HasValidBasicCredentials(request, settings))
         {
+            callbacks.LogTurnedAway(EventSource.Advice, "invalid-credentials");
             request.HttpContext.Response.Headers.WWWAuthenticate = "Basic realm=\"acme-advice\"";
             return Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Invalid credentials");
         }
@@ -28,6 +29,7 @@ public static class CallbackEndpoints
         var body = await ReadBodyAsync(request, cancellationToken);
         if (body is null)
         {
+            callbacks.LogTurnedAway(EventSource.Advice, "body-too-large");
             return Results.Problem(statusCode: StatusCodes.Status413PayloadTooLarge, title: "Body too large");
         }
 
@@ -67,12 +69,14 @@ public static class CallbackEndpoints
         var body = await ReadBodyAsync(request, cancellationToken);
         if (body is null)
         {
+            callbacks.LogTurnedAway(EventSource.Webhook, "body-too-large");
             return Results.Problem(statusCode: StatusCodes.Status413PayloadTooLarge, title: "Body too large");
         }
 
         // The signature is over the exact bytes, so it is checked before anything is parsed.
         if (!HasValidSignature(request, settings, body))
         {
+            callbacks.LogTurnedAway(EventSource.Webhook, "invalid-signature");
             return Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Invalid signature");
         }
 

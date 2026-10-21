@@ -68,7 +68,8 @@ public sealed record ClaimedReconciliation(
     PaymentStatus Status,
     long? AuthAmountMinor,
     DateTimeOffset? FirstSentAt,
-    int RttqAttempts);
+    int RttqAttempts,
+    string? OrderNumber = null);
 
 public sealed record StuckPayment(Guid PaymentId, int AttemptCount);
 

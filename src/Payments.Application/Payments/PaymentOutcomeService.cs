@@ -60,6 +60,7 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
                     logger.LogError("ALERT payment {PaymentId} flagged for investigation after late {EventType} (status {Status})", paymentId, type, decision.Status);
                 }
 
+                LogTransition(logger, state, decision.Status, "late-webhook-adopted", type, EventSource.Webhook);
                 return new PaymentUpdate(decision.Status, state.AuthAmountMinor, needsInvestigation);
             },
             cancellationToken);
@@ -109,6 +110,33 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
             logger.LogError("ALERT payment {PaymentId} flagged for investigation after {EventType} (status {Status})", state.PaymentId, paymentEvent.Type, decision.Status);
         }
 
-        return adjust(state, new PaymentUpdate(decision.Status, authAmount, needsInvestigation, AuthAmountRejected: inconsistent));
+        var update = adjust(state, new PaymentUpdate(decision.Status, authAmount, needsInvestigation, AuthAmountRejected: inconsistent));
+        LogTransition(logger, state, update.Status, ReasonFor(paymentEvent), paymentEvent.Type, paymentEvent.Source);
+        return update;
     }
+
+    private static void LogTransition(ILogger logger, PaymentState state, PaymentStatus newStatus, string reason, PaymentEventType eventType, EventSource source)
+    {
+        if (newStatus == state.Status)
+        {
+            logger.LogDebug(
+                "Payment {PaymentId} stays {Status}: {EventType} from {Source} ({Reason})",
+                state.PaymentId, state.Status, eventType, source, reason);
+            return;
+        }
+
+        logger.LogInformation(
+            "Payment {PaymentId} transition {OldStatus} -> {NewStatus}: {Reason} ({EventType} from {Source})",
+            state.PaymentId, state.Status, newStatus, reason, eventType, source);
+    }
+
+    // System events carry their reason as the dedup-key prefix (lease-expired:, pending-expired:, rttq-resend:, rttq-backoff:).
+    private static string ReasonFor(NewPaymentEvent paymentEvent) => paymentEvent.Source switch
+    {
+        EventSource.AcmePostResponse => "post-response",
+        EventSource.Advice => "advice",
+        EventSource.Webhook => "webhook",
+        EventSource.Rttq => "rttq-found",
+        _ => paymentEvent.DedupKey.Split(':')[0],
+    };
 }

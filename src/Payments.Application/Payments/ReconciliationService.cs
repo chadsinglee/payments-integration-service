@@ -46,6 +46,11 @@ public sealed class ReconciliationService(
     public async Task<int> AdoptUnmatchedWebhooksAsync(CancellationToken cancellationToken)
     {
         var due = await store.FindDueUnmatchedWebhooksAsync(SweepBatch, settings.BackoffBase, settings.BackoffCap, cancellationToken);
+        if (due.Count > 0)
+        {
+            logger.LogInformation("Unmatched-event sweep: {DueCount} event(s) due", due.Count);
+        }
+
         var progressed = 0;
         foreach (var item in due)
         {
@@ -56,10 +61,13 @@ public sealed class ReconciliationService(
                 var age = timeProvider.GetUtcNow() - item.ReceivedAt;
                 var exhausted = attempts >= settings.UnmatchedMaxAttempts || age >= settings.UnmatchedMaxAge;
                 await store.RecordUnmatchedAttemptAsync(item.EventId, exhausted, cancellationToken);
+                logger.LogWarning(
+                    "Unmatched-event sweep: event {EventId} ({EventType}, OrderNumber {OrderNumber}) matched no payment, attempt {AttemptCount}",
+                    item.EventId, item.Type, item.Rrn, attempts);
                 if (exhausted)
                 {
                     logger.LogError(
-                        "ALERT unmatched webhook event {EventId} ({EventType}) matched no payment after {Attempts} attempts over {AgeMinutes:F0} min; giving up, needs investigation",
+                        "ALERT unmatched webhook event {EventId} ({EventType}) matched no payment after {AttemptCount} attempts over {AgeMinutes:F0} min; giving up, needs investigation",
                         item.EventId, item.Type, attempts, age.TotalMinutes);
                 }
 
@@ -76,11 +84,16 @@ public sealed class ReconciliationService(
                 type = PaymentEventType.Informational;
             }
 
+            using var adoptScope = logger.BeginScope("PaymentId={PaymentId} OrderNumber={OrderNumber}", paymentId.Value, item.Rrn);
             var result = await outcomes.AdoptAsync(item.EventId, paymentId.Value, type, invalid is not null, cancellationToken);
             if (result == ApplyEventResult.Applied)
             {
                 logger.LogInformation("Adopted late webhook event {EventId} for payment {PaymentId} as {EventType}", item.EventId, paymentId, type);
                 progressed++;
+            }
+            else
+            {
+                logger.LogInformation("Late webhook event {EventId} for payment {PaymentId} not adopted: {Result}", item.EventId, paymentId, result);
             }
         }
 
@@ -102,7 +115,7 @@ public sealed class ReconciliationService(
                 cancellationToken);
             if (result == ApplyEventResult.Applied)
             {
-                logger.LogWarning("Payment {PaymentId} lease expired on attempt {Attempt}; outcome marked Unknown for reconciliation", payment.PaymentId, payment.AttemptCount);
+                logger.LogWarning("Payment {PaymentId} lease expired on attempt {AttemptCount}; outcome marked Unknown for reconciliation", payment.PaymentId, payment.AttemptCount);
             }
         }
 
@@ -150,7 +163,10 @@ public sealed class ReconciliationService(
             return false;
         }
 
-        using var scope = logger.BeginScope("PaymentId={PaymentId} TransactionId={TransactionId}", claimed.PaymentId, claimed.TransactionId);
+        using var scope = logger.BeginScope(
+            "PaymentId={PaymentId} TransactionId={TransactionId} OrderNumber={OrderNumber} AttemptCount={AttemptCount}",
+            claimed.PaymentId, claimed.TransactionId, claimed.OrderNumber, claimed.RttqAttempts);
+        logger.LogDebug("RTTQ claim won for payment {PaymentId} (status {Status})", claimed.PaymentId, claimed.Status);
 
         GateAdmission admission;
         try
@@ -165,6 +181,7 @@ public sealed class ReconciliationService(
 
         if (!admission.Granted)
         {
+            logger.LogInformation("Acme limiter denied RTTQ for payment {PaymentId}; claim released, retry in {RetryAfter}", claimed.PaymentId, admission.RetryAfter);
             await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, timeProvider.GetUtcNow() + admission.RetryAfter, CancellationToken.None);
             return false;
         }
@@ -178,7 +195,7 @@ public sealed class ReconciliationService(
             if (!await store.ExtendReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, lease, CancellationToken.None))
             {
                 gate.AbandonProbe(admission);
-                logger.LogWarning("RTTQ for payment {PaymentId} skipped: attempt {Attempt} no longer owns its claim", claimed.PaymentId, claimed.RttqAttempts);
+                logger.LogWarning("RTTQ for payment {PaymentId} skipped: attempt {AttemptCount} no longer owns its claim (lease extension failed)", claimed.PaymentId, claimed.RttqAttempts);
                 return false;
             }
         }
@@ -189,6 +206,8 @@ public sealed class ReconciliationService(
             throw;
         }
 
+        var messageId = Guid.NewGuid();
+        using var callScope = logger.BeginScope("MessageId={MessageId}", messageId);
         gate.LogDispatch(admission, "RTTQ");
         var result = await acmeClient.QueryTransactionAsync(claimed.TransactionId, CancellationToken.None);
 
@@ -197,7 +216,7 @@ public sealed class ReconciliationService(
         await store.RecordInteractionAsync(
             new AcmeInteraction(
                 claimed.PaymentId,
-                Guid.NewGuid(),
+                messageId,
                 result.RedactedRequestJson,
                 result.HttpStatus,
                 result.ResponseBody,
@@ -231,7 +250,7 @@ public sealed class ReconciliationService(
         }
 
         logger.LogInformation(
-            "Reconciled payment {PaymentId} (RTTQ attempt {Attempt}): {Action} {EventType}, HTTP {HttpStatus}",
+            "RTTQ result for payment {PaymentId} (attempt {AttemptCount}): {Action} {EventType}, HTTP {HttpStatus}",
             claimed.PaymentId,
             claimed.RttqAttempts,
             outcome.Action,
@@ -276,6 +295,9 @@ public sealed class ReconciliationService(
         {
             // Outside the window, or with the attempts used up, a resend is unsafe and a failure unproven: stop and flag
             // for a human. An approved payment Acme cannot find (amount fetch) just keeps backing off.
+            logger.LogInformation(
+                "RTTQ 404 for payment {PaymentId}: no resend (status {Status}, attempt {AttemptCount}, resend window {ResendWindow}); backing off or giving up",
+                claimed.PaymentId, claimed.Status, claimed.RttqAttempts, settings.ResendWindow);
             await BackOffAsync(claimed, "NotFound", giveUpIfUnknown: true);
             return;
         }
@@ -283,6 +305,9 @@ public sealed class ReconciliationService(
         // Acme never saw it: resubmit the same TransactionID with a new MessageID (the worker claims it as Pending).
         // The first resend is immediate (the customer is waiting); later ones back off so a gateway that keeps failing is not hammered.
         var resendAt = claimed.RttqAttempts <= 1 ? now : now + settings.Backoff(claimed.RttqAttempts - 1);
+        logger.LogInformation(
+            "RTTQ 404 for payment {PaymentId}: resending the same TransactionId with a new MessageId at {ResendAt:O} (attempt {AttemptCount})",
+            claimed.PaymentId, resendAt, claimed.RttqAttempts);
         var resend = SystemEvent(PaymentEventType.Informational, $"rttq-resend:{claimed.PaymentId}:{claimed.RttqAttempts}", "rttq-404-resend");
         await outcomes.ApplyAsync(
             claimed.PaymentId,
@@ -325,7 +350,7 @@ public sealed class ReconciliationService(
             return update with { Reconciliation = ReconciliationState.InProgress, NextAttemptAt = timeProvider.GetUtcNow() + settings.Backoff(claimed.RttqAttempts) };
         }
 
-        logger.LogError("ALERT payment {PaymentId} could not be reconciled after {Attempts} RTTQ attempt(s) ({Reason}); needs investigation", claimed.PaymentId, claimed.RttqAttempts, reason);
+        logger.LogError("ALERT payment {PaymentId} could not be reconciled after {AttemptCount} RTTQ attempt(s) ({Reason}); needs investigation", claimed.PaymentId, claimed.RttqAttempts, reason);
         return update with { NeedsInvestigation = true, Reconciliation = ReconciliationState.Exhausted };
     }
 

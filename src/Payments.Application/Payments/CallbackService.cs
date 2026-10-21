@@ -48,6 +48,10 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
         logger.LogWarning("Rejected {Source} callback: {Reason} (hash {PayloadHash}, {Length} chars)", source, reason, payloadHash, body.Length);
     }
 
+    /// <summary>A callback turned away before it could be trusted (bad credentials, bad signature, oversized). Nothing from the request is logged.</summary>
+    public void LogTurnedAway(EventSource source, string reason) =>
+        logger.LogWarning("Callback turned away: Source {Source}, {Reason}", source, reason);
+
     // Postgres text cannot hold NUL, and cutting between a surrogate pair would not encode as UTF-8.
     private static string Printable(string body)
     {
@@ -73,7 +77,7 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
             null);
 
         var paymentId = await store.FindPaymentIdByTransactionIdAsync(command.TransactionId, cancellationToken);
-        return await ApplyAsync(paymentId, paymentEvent, "advice", command.TransactionId.ToString(), cancellationToken);
+        return await ApplyAsync(paymentId, paymentEvent, command.TransactionId, null, cancellationToken);
     }
 
     public async Task<CallbackResult> HandleWebhookAsync(WebhookCommand command, CancellationToken cancellationToken)
@@ -109,50 +113,57 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
         if (invalid is not null)
         {
             // Stored for the audit trail but never applied: the payment is flagged instead of changing status.
-            logger.LogError("ALERT webhook {Reference} for payment {PaymentId} is inconsistent ({Reason}); stored, not applied", command.TransactionUuid, paymentId, invalid);
+            logger.LogError("ALERT webhook {DedupKey} for payment {PaymentId} is inconsistent ({Reason}); stored, not applied", paymentEvent.DedupKey, paymentId, invalid);
             paymentEvent = paymentEvent with { Type = PaymentEventType.Informational };
-            return await ApplyAsync(paymentId, paymentEvent, "webhook", command.TransactionUuid, cancellationToken, flag: true);
+            return await ApplyAsync(paymentId, paymentEvent, null, command.Rrn, cancellationToken, flag: true);
         }
 
-        return await ApplyAsync(paymentId, paymentEvent, "webhook", command.TransactionUuid, cancellationToken);
+        return await ApplyAsync(paymentId, paymentEvent, null, command.Rrn, cancellationToken);
     }
 
     private Task<string?> ValidateAgainstPaymentAsync(Guid paymentId, WebhookCommand command, CancellationToken cancellationToken) =>
         outcomes.ValidateReversalAsync(paymentId, command.Currency, command.AmountMinor, cancellationToken);
 
+    // Advice is matched by TransactionId, a webhook by OrderNumber (its rrn); both are known before the payment is.
     private async Task<CallbackResult> ApplyAsync(
         Guid? paymentId,
         NewPaymentEvent paymentEvent,
-        string kind,
-        string reference,
+        Guid? transactionId,
+        string? orderNumber,
         CancellationToken cancellationToken,
         bool flag = false)
     {
+        var source = paymentEvent.Source;
+        var dedupKey = paymentEvent.DedupKey;
         if (paymentId is null)
         {
             var unmatched = await store.RecordUnmatchedEventAsync(paymentEvent, cancellationToken);
             if (unmatched == ApplyEventResult.Conflict)
             {
-                logger.LogError("ALERT unmatched {Kind} {Reference} was redelivered with a different payload", kind, reference);
+                logger.LogError("ALERT unmatched callback Source {Source} DedupKey {DedupKey} was redelivered with a different payload", source, dedupKey);
             }
             else
             {
-                logger.LogWarning("Stored unmatched {Kind} {Reference} ({Result})", kind, reference, unmatched);
+                logger.LogWarning("Callback unmatched, stored: Source {Source} DedupKey {DedupKey} OrderNumber {OrderNumber} ({Result})", source, dedupKey, orderNumber, unmatched);
             }
 
             return CallbackResult.Unmatched;
         }
 
+        // Everything below, including the shared outcome path's transition line, carries the matched payment's id.
+        using var scope = logger.BeginScope("PaymentId={PaymentId} TransactionId={TransactionId} OrderNumber={OrderNumber}", paymentId.Value, transactionId, orderNumber);
         var result = flag
             ? await outcomes.ApplyAsync(paymentId.Value, paymentEvent, static (_, update) => update with { NeedsInvestigation = true }, cancellationToken)
             : await outcomes.ApplyAsync(paymentId.Value, paymentEvent, cancellationToken);
         if (result == ApplyEventResult.Conflict)
         {
-            logger.LogError("ALERT {Kind} {Reference} was redelivered with a different payload; payment {PaymentId} flagged", kind, reference, paymentId);
+            logger.LogError("ALERT callback Source {Source} DedupKey {DedupKey} was redelivered with a different payload; payment {PaymentId} flagged", source, dedupKey, paymentId);
         }
         else
         {
-            logger.LogInformation("Recorded {Kind} {Reference} for payment {PaymentId}: {EventType} ({Result})", kind, reference, paymentId, paymentEvent.Type, result);
+            logger.LogInformation(
+                "Callback {Result}: Source {Source} DedupKey {DedupKey} for payment {PaymentId}: {EventType}",
+                result == ApplyEventResult.Applied ? "applied" : "duplicate", source, dedupKey, paymentId, paymentEvent.Type);
         }
 
         return result switch

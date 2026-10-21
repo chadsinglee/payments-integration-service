@@ -449,14 +449,14 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             FROM next
             WHERE p.id = next.id
             RETURNING p.id AS PaymentId, p.transaction_id AS TransactionId, p.status AS Status, p.auth_amount AS AuthAmount,
-                      p.first_sent_at AS FirstSentAt, p.rttq_attempts AS RttqAttempts
+                      p.first_sent_at AS FirstSentAt, p.rttq_attempts AS RttqAttempts, p.order_number AS OrderNumber
             """,
             new { leaseSeconds = lease.TotalSeconds },
             cancellationToken: cancellationToken));
 
         return row is null
             ? null
-            : new ClaimedReconciliation(row.PaymentId, row.TransactionId, Enum.Parse<PaymentStatus>(row.Status), row.AuthAmount, row.FirstSentAt, row.RttqAttempts);
+            : new ClaimedReconciliation(row.PaymentId, row.TransactionId, Enum.Parse<PaymentStatus>(row.Status), row.AuthAmount, row.FirstSentAt, row.RttqAttempts, row.OrderNumber);
     }
 
     public async Task<IReadOnlyList<StuckPayment>> FindExpiredLeasesAsync(int limit, CancellationToken cancellationToken)
@@ -555,6 +555,8 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         public DateTimeOffset? FirstSentAt { get; init; }
 
         public int RttqAttempts { get; init; }
+
+        public string? OrderNumber { get; init; }
     }
 
     private sealed class FactRow

@@ -110,7 +110,8 @@ public sealed class SubmitAndApproveTests(PostgresFixture postgres) : IAsyncLife
         await using var connection = new NpgsqlConnection(_connectionString);
         var ids = await connection.QuerySingleAsync<(Guid Id, Guid TransactionId)>("SELECT id, transaction_id FROM payments WHERE app_payment_id = 'pay-scope'");
         var outcome = harness.Logs.AllWithScopes.Split('\n').Single(line => line.Contains("submitted as"));
-        outcome.ShouldStartWith($"[PaymentId={ids.Id} TransactionId={ids.TransactionId}]");
+        outcome.ShouldStartWith($"[PaymentId={ids.Id} TransactionId={ids.TransactionId} OrderNumber=");
+        outcome.ShouldContain("AttemptCount=1");
     }
 
     [Fact]

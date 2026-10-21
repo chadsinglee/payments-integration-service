@@ -41,7 +41,7 @@ public class PaymentOutcomeServiceTests
 
         update.AuthAmountMinor.ShouldBe(authorised);
         update.NeedsInvestigation.ShouldBeFalse();
-        logger.Messages.ShouldBeEmpty();
+        logger.Messages.ShouldNotContain(message => message.Contains("ALERT"));
     }
 
     [Fact]

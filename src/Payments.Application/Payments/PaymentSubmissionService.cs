@@ -30,7 +30,10 @@ public sealed class PaymentSubmissionService(
         }
 
         // Every log line for this payment (ours and the HTTP client's) carries these ids.
-        using var scope = logger.BeginScope("PaymentId={PaymentId} TransactionId={TransactionId}", claimed.PaymentId, claimed.TransactionId);
+        using var scope = logger.BeginScope(
+            "PaymentId={PaymentId} TransactionId={TransactionId} OrderNumber={OrderNumber} AttemptCount={AttemptCount}",
+            claimed.PaymentId, claimed.TransactionId, claimed.OrderNumber, claimed.AttemptCount);
+        logger.LogDebug("Claim won for payment {PaymentId}", claimed.PaymentId);
 
         GateAdmission admission;
         try
@@ -45,6 +48,7 @@ public sealed class PaymentSubmissionService(
 
         if (!admission.Granted)
         {
+            logger.LogInformation("Acme limiter denied payment {PaymentId}; claim released, retry in {RetryAfter}", claimed.PaymentId, admission.RetryAfter);
             await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow() + admission.RetryAfter, CancellationToken.None);
             return false;
         }
@@ -62,7 +66,7 @@ public sealed class PaymentSubmissionService(
             if (!await store.ExtendClaimAsync(claimed.PaymentId, claimed.AttemptCount, lease, CancellationToken.None))
             {
                 gate.AbandonProbe(admission);
-                logger.LogWarning("Payment {PaymentId} was not sent: attempt {Attempt} no longer owns its claim (lease expired or taken over)", claimed.PaymentId, claimed.AttemptCount);
+                logger.LogWarning("Payment {PaymentId} was not sent: attempt {AttemptCount} no longer owns its claim (lease extension failed: expired or taken over)", claimed.PaymentId, claimed.AttemptCount);
                 return false;
             }
 
@@ -75,6 +79,7 @@ public sealed class PaymentSubmissionService(
             throw;
         }
 
+        using var callScope = logger.BeginScope("MessageId={MessageId}", request.MessageId);
         gate.LogDispatch(admission, "POST");
         var result = await acmeClient.SubmitPaymentAsync(request, CancellationToken.None);
 
@@ -112,7 +117,7 @@ public sealed class PaymentSubmissionService(
 
         LogAlert(claimed, outcome.Alert);
         logger.LogInformation(
-            "Payment {PaymentId} submitted as {TransactionId} (attempt {Attempt}): {EventType}, HTTP {HttpStatus}",
+            "Payment {PaymentId} submitted as {TransactionId} (attempt {AttemptCount}): {EventType}, HTTP {HttpStatus}",
             claimed.PaymentId,
             claimed.TransactionId,
             claimed.AttemptCount,

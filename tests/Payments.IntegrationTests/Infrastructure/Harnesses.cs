@@ -140,7 +140,7 @@ public sealed class CapturingLoggerProvider : ILoggerProvider
             where TState : notnull
         {
             var previous = owner._scope.Value;
-            owner._scope.Value = state.ToString();
+            owner._scope.Value = previous is null ? state.ToString() : $"{previous} {state}";
             return new Restore(owner, previous);
         }
 
