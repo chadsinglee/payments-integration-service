@@ -74,6 +74,31 @@ public sealed class LoggingTests(PostgresFixture postgres) : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task LeaseExpiredAndAdviceLines_CarryTheirPaymentScope()
+    {
+        (await _client.PostAsJsonAsync("/payments", new { paymentId = "pay-scope", customerId = "cust-001", subMerchantId = "ZAP0004182", amount = 5_000 }))
+            .StatusCode.ShouldBe(HttpStatusCode.Accepted);
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new LoseResponseHandler(inner));
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await Execute("UPDATE payments SET status = 'Submitted', lease_until = now() - interval '1 second'");
+
+        (await harness.Reconciliation.RecoverExpiredLeasesAsync(CancellationToken.None)).ShouldBe(1);
+
+        var payment = await WithConnection(c => c.QuerySingleAsync<(Guid Id, Guid TransactionId, string OrderNumber)>(
+            "SELECT id, transaction_id, order_number FROM payments WHERE app_payment_id = 'pay-scope'"));
+        var scope = $"PaymentId={payment.Id} TransactionId={payment.TransactionId} OrderNumber={payment.OrderNumber} AttemptCount=1";
+        harness.Logs.AllWithScopes.Split('\n').ShouldContain(l => l.Contains("lease expired on attempt 1") && l.Contains(scope));
+
+        var advice = $$"""{"RequestType":"Payment","MerchantID":"{{ApiFactory.MerchantId}}","TransactionID":"{{payment.TransactionId}}","TransactionDateTime":"2026-03-01T13:56:36.533","Amount":5000,"TransactionStatus":"Success","ResponseSource":"Acquirer","ResponseCode":"00","AuthCode":"238699","CommProtocol":"REST"}""";
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/acme/advice") { Content = new StringContent(advice, Encoding.UTF8, "application/json") };
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue(
+            "Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{ApiFactory.AdviceUsername}:{ApiFactory.AdvicePassword}")));
+        (await _client.SendAsync(request)).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        _api.Logs.AllWithScopes.Split('\n').ShouldContain(l => l.Contains("Source Advice") && l.Contains($"PaymentId={payment.Id}") && l.Contains($"OrderNumber={payment.OrderNumber}"));
+    }
+
     private static string Sign(string secret, string body) =>
         Convert.ToBase64String(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(body)));
 

@@ -350,6 +350,15 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             cancellationToken: cancellationToken));
     }
 
+    public async Task<string?> GetOrderNumberAsync(Guid paymentId, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        return await connection.QuerySingleOrDefaultAsync<string?>(new CommandDefinition(
+            "SELECT order_number FROM payments WHERE id = @paymentId",
+            new { paymentId },
+            cancellationToken: cancellationToken));
+    }
+
     public async Task<PaymentTerms?> GetTermsAsync(Guid paymentId, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
@@ -463,7 +472,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         var rows = await connection.QueryAsync<StuckPayment>(new CommandDefinition(
-            "SELECT id AS PaymentId, attempt_count AS AttemptCount FROM payments WHERE status = 'Submitted' AND lease_until < now() ORDER BY lease_until LIMIT @limit",
+            "SELECT id AS PaymentId, attempt_count AS AttemptCount, transaction_id AS TransactionId, order_number AS OrderNumber FROM payments WHERE status = 'Submitted' AND lease_until < now() ORDER BY lease_until LIMIT @limit",
             new { limit },
             cancellationToken: cancellationToken));
         return rows.ToList();

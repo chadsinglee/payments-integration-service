@@ -77,7 +77,8 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
             null);
 
         var paymentId = await store.FindPaymentIdByTransactionIdAsync(command.TransactionId, cancellationToken);
-        return await ApplyAsync(paymentId, paymentEvent, command.TransactionId, null, cancellationToken);
+        var orderNumber = paymentId is null ? null : await store.GetOrderNumberAsync(paymentId.Value, cancellationToken);
+        return await ApplyAsync(paymentId, paymentEvent, command.TransactionId, orderNumber, cancellationToken);
     }
 
     public async Task<CallbackResult> HandleWebhookAsync(WebhookCommand command, CancellationToken cancellationToken)

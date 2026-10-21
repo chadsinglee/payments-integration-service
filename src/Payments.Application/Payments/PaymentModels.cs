@@ -71,7 +71,7 @@ public sealed record ClaimedReconciliation(
     int RttqAttempts,
     string? OrderNumber = null);
 
-public sealed record StuckPayment(Guid PaymentId, int AttemptCount);
+public sealed record StuckPayment(Guid PaymentId, int AttemptCount, Guid TransactionId, string OrderNumber);
 
 public enum ApplyEventResult
 {

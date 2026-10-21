@@ -106,6 +106,9 @@ public sealed class ReconciliationService(
         var stuck = await store.FindExpiredLeasesAsync(SweepBatch, cancellationToken);
         foreach (var payment in stuck)
         {
+            using var scope = logger.BeginScope(
+                "PaymentId={PaymentId} TransactionId={TransactionId} OrderNumber={OrderNumber} AttemptCount={AttemptCount}",
+                payment.PaymentId, payment.TransactionId, payment.OrderNumber, payment.AttemptCount);
             var key = $"lease-expired:{payment.PaymentId}:{payment.AttemptCount}";
             // Re-checked under the row lock: a release or callback may have moved the payment on since the scan.
             var result = await outcomes.ApplyIfAsync(
