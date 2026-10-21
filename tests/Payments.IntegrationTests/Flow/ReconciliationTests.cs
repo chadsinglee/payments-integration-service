@@ -245,6 +245,29 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Reconcile_WhenRttqReturns5xx_BacksOffAndDoesNotResend()
+    {
+        await Post("pay-1", 5_000);
+        var rttq = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new FailQueriesHandler(rttq.Wrap(new LoseResponseHandler(inner))));
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        var transactionId = await TransactionIdAsync("pay-1");
+        await MakeDue();
+
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Unknown");
+        row.RttqAttempts.ShouldBe(1);
+        row.ReconciliationState.ShouldBe("InProgress");
+        row.NeedsInvestigation.ShouldBeFalse();
+        (await Scalar<bool>("SELECT next_attempt_at > now() FROM payments")).ShouldBeTrue();
+        (await Scalar<Guid>("SELECT transaction_id FROM payments")).ShouldBe(transactionId);
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(1);
+        rttq.Posts.ShouldBe(1);
+    }
+
+    [Fact]
     public async Task ExpireStalePending_WhenNeverSentWithinTheExpiry_FailsThePayment()
     {
         await Post("pay-1", 5_000);
@@ -529,6 +552,14 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
                 return base.SendAsync(request, cancellationToken);
             }
         }
+    }
+
+    private sealed class FailQueriesHandler(HttpMessageHandler inner) : DelegatingHandler(inner)
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            request.Method == HttpMethod.Get
+                ? Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{}") })
+                : base.SendAsync(request, cancellationToken);
     }
 
     private sealed class LoseResponseHandler(HttpMessageHandler inner) : DelegatingHandler(inner)

@@ -199,6 +199,32 @@ public sealed class ThroughputProtectionTests(PostgresFixture postgres) : IAsync
     }
 
     [Fact]
+    public async Task SubmitAndReconcile_WhenTheyShareOneLimiter_SpendTheSameBudget()
+    {
+        await Post("pay-1", 5_000);
+        var limiter = new BudgetLimiter(1);
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new LoseResponseHandler(inner), limiter: limiter);
+
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        limiter.Granted.ShouldBe(1);
+        (await Row("pay-1")).Status.ShouldBe("Unknown");
+        await MakeDue();
+
+        // The POST spent the only token, so the RTTQ query must wait rather than call Acme.
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+        limiter.Granted.ShouldBe(1);
+        limiter.Denied.ShouldBeGreaterThan(0);
+        (await Row("pay-1")).Status.ShouldBe("Unknown");
+        (await Row("pay-1")).RttqAttempts.ShouldBe(0);
+
+        limiter.Refill(1);
+        await MakeDue();
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+        limiter.Granted.ShouldBe(2);
+        (await Row("pay-1")).Status.ShouldBe("Approved");
+    }
+
+    [Fact]
     public async Task Submit_WhenTheLeaseExpiresWhileWaitingForTheLimiter_DoesNotPost()
     {
         await Post("pay-1", 5_000);
@@ -396,6 +422,34 @@ public sealed class ThroughputProtectionTests(PostgresFixture postgres) : IAsync
         {
             Calls++;
             return Task.FromResult(result);
+        }
+
+        public Task ShareCooldownAsync(TimeSpan duration, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class BudgetLimiter(int tokens) : IAcmeRateLimiter
+    {
+        private int _tokens = tokens;
+        private int _granted;
+        private int _denied;
+
+        public int Granted => _granted;
+
+        public int Denied => _denied;
+
+        public void Refill(int count) => Interlocked.Add(ref _tokens, count);
+
+        public Task<RateLimitResult> TryAcquireAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Decrement(ref _tokens) >= 0)
+            {
+                Interlocked.Increment(ref _granted);
+                return Task.FromResult(new RateLimitResult(RateLimitStatus.Granted));
+            }
+
+            Interlocked.Increment(ref _tokens);
+            Interlocked.Increment(ref _denied);
+            return Task.FromResult(new RateLimitResult(RateLimitStatus.Wait, TimeSpan.FromMilliseconds(100)));
         }
 
         public Task ShareCooldownAsync(TimeSpan duration, CancellationToken cancellationToken) => Task.CompletedTask;

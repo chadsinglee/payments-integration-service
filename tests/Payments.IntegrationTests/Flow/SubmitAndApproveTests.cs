@@ -61,6 +61,16 @@ public sealed class SubmitAndApproveTests(PostgresFixture postgres) : IAsyncLife
     }
 
     [Fact]
+    public async Task SubmitPayment_WhenAccepted_PointsLocationAtTheNewPayment()
+    {
+        var response = await Post(new { paymentId = "pay-loc", customerId = "cust-001", subMerchantId = "ZAP0004182", amount = 1_000 });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Accepted);
+        response.Headers.Location.ShouldNotBeNull().OriginalString.ShouldBe("/payments/pay-loc");
+        (await Get("pay-loc")).GetProperty("status").GetString().ShouldBe("Pending");
+    }
+
+    [Fact]
     public async Task SubmitNext_WhenGatewayReturns503_EndsUnknownAfterExactlyOnePost()
     {
         await Post(new { paymentId = "pay-503", customerId = "cust-001", subMerchantId = "ZAP0004182", amount = 99_503 });
