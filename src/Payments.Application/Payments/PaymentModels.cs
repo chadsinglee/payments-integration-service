@@ -50,6 +50,8 @@ public sealed record ClaimedPayment(
 
 public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? AuthAmountMinor, bool NeedsInvestigation = false);
 
+public sealed record PaymentTerms(string Currency, long AmountMinor, long? AuthAmountMinor);
+
 public sealed record PaymentUpdate(
     PaymentStatus Status,
     long? AuthAmountMinor,

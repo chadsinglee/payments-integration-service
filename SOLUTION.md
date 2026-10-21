@@ -89,7 +89,9 @@ Stored status is recomputed from all of a payment's events under the row lock (o
 | Acme result | Our status/action |
 |---|---|
 | 200, `Success`, code `00` | `Approved` (store `AuthAmount`) |
-| 200, `Success`, code != `00` from acquirer | `Declined` |
+| 200, `Success`, code `COMPL` from source `EFT` | `Approved` (EFT collection completed; not expected for our card-not-present payments) |
+| 200, code `PEND`, or `COMPL` from a non-EFT source | Not final: stays `Unknown`, RTTQ keeps asking (advice: stored, no status change) |
+| 200, `Success`, other code != `00` from acquirer | `Declined` |
 | 200, `Failure` from Application source (E-codes) | `Failed` |
 | 400/E01 | `Failed` + alert (bug on our side) |
 | 401/E02 | `acme-401` |
@@ -100,6 +102,7 @@ Stored status is recomputed from all of a payment's events under the row lock (o
 | RTTQ `Processing` | Stay `Unknown`, back off |
 | RTTQ 404 | `rttq-404` |
 
+Webhook checks: `transactionAmount` must be a whole non-negative number (`1999` and `1999.0` are accepted, `19.99` is rejected with 400 and stored as a rejected callback). An approved reversal or refund whose `currencyCode` differs from the payment's, or whose amount exceeds the payment (the approved amount once known), is stored as `Informational`, never applied, and flags the payment for investigation with an ALERT log.
 ## 4. Pack overrides
 | Pack rule | What this repo does instead | Spec reference |
 |---|---|---|
@@ -163,7 +166,7 @@ Summary [daily-summary-semantics, settlement-cutoff]: SQL over payment facts + e
 - `payment_events`: append-only facts (POST results, RTTQ results, advices, webhooks) with a unique `(source, dedup_key)` and a payload hash. Status and the summary are derived from these.
 - `event_conflicts`: same dedup key with a different hash, or conflicting acquirer outcomes.
 - `rejected_callbacks`: authenticated callbacks that failed validation (bounded body, deduplicated by hash).
-- `acme_interactions`: redacted request/response audit of every Acme call.
+- `acme_interactions`: request/response audit of every Acme call; the request copy has the card token and customer email redacted.
 
 **Trade-offs.**
 - Postgres is both store and queue (rows with leases and `SKIP LOCKED`), so there is no dual write and no extra infrastructure. Cost: polling, and throughput bounded by Postgres, which is ample at Acme's 20 calls per second.
@@ -224,7 +227,7 @@ Summary [daily-summary-semantics, settlement-cutoff]: SQL over payment facts + e
 - [x] Unit + integration tests (`tests/`)
 - [x] `README.md`: local run instructions
 - [x] `SOLUTION.md` sections 7-10 complete
-- [x] AI config in tool-expected locations (`AGENTS.md`, `.github/`) present (not committed, as instructed)
+- [x] AI config in tool-expected locations (`AGENTS.md`, `.github/`) present and committed (branch `feature/payments-submission`)
 - [x] `ai/` directory: plans, redacted session transcripts (`ai/transcripts/`), slice 6-9 summaries and `ai/spec-conformance.md`
 - [ ] 5-10 minute video walkthrough (architecture, key decisions/trade-offs, implementation highlights) - **owner: user, not producible by the agent**
 

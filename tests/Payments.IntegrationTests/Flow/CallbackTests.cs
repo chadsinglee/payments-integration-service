@@ -188,6 +188,60 @@ public sealed class CallbackTests(PostgresFixture postgres) : IAsyncLifetime
         (await SendSignedWebhookAsync(body)).StatusCode.ShouldBe(HttpStatusCode.BadRequest);
     }
 
+    [Theory]
+    [InlineData("4000.0")]
+    [InlineData("4E3")]
+    public async Task Webhook_WhenAmountIsAWholeNumberWrittenWithADecimalPointOrExponent_IsAppliedAsMinorUnits(string amount)
+    {
+        var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);
+
+        (await SendSignedWebhookAsync(Webhook("u-1", "Refund", rrn, amount))).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        (await StatusAsync("pay-1")).ShouldBe("PartiallyRefunded");
+        (await CountAsync("SELECT count(*) FROM payment_events WHERE source = 3 AND amount_minor = 4000")).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Webhook_WhenAmountIsNegative_IsBadRequest() =>
+        (await SendSignedWebhookAsync(Webhook("u-1", "Refund", "Z00000000001", "-100"))).StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+
+    [Fact]
+    public async Task Webhook_WhenReversalExceedsThePaymentAmount_IsStoredFlaggedAndNotApplied()
+    {
+        var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);
+
+        (await SendSignedWebhookAsync(Webhook("u-1", "Reversal", rrn, 10_001))).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        (await StatusAsync("pay-1")).ShouldBe("Approved");
+        (await CountAsync("SELECT count(*) FROM payments WHERE needs_investigation")).ShouldBe(1);
+        (await CountAsync("SELECT count(*) FROM payment_events WHERE source = 3")).ShouldBe(1);
+    }
+
+    [Theory]
+    [InlineData("Reversal")]
+    [InlineData("Refund")]
+    public async Task Webhook_WhenCurrencyDiffersFromThePayment_IsStoredFlaggedAndNotApplied(string type)
+    {
+        var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);
+
+        (await SendSignedWebhookAsync(Webhook("u-1", type, rrn, 1_000, currency: "USD"))).StatusCode.ShouldBe(HttpStatusCode.OK);
+
+        (await StatusAsync("pay-1")).ShouldBe("Approved");
+        (await CountAsync("SELECT count(*) FROM payments WHERE needs_investigation")).ShouldBe(1);
+        (await CountAsync("SELECT count(*) FROM payment_events WHERE source = 3")).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task Webhook_WhenReversalIsConsistent_IsNotFlagged()
+    {
+        var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);
+
+        await SendSignedWebhookAsync(Webhook("u-1", "Reversal", rrn, 10_000));
+
+        (await StatusAsync("pay-1")).ShouldBe("Reversed");
+        (await CountAsync("SELECT count(*) FROM payments WHERE needs_investigation")).ShouldBe(0);
+    }
+
     [Fact]
     public async Task Webhook_WhenSignedButNotJson_IsBadRequest() =>
         (await SendSignedWebhookAsync("not json")).StatusCode.ShouldBe(HttpStatusCode.BadRequest);
@@ -348,8 +402,8 @@ public sealed class CallbackTests(PostgresFixture postgres) : IAsyncLifetime
             ["CommProtocol"] = "REST",
         }.Concat(extra ? [new KeyValuePair<string, object?>("SomethingNew", new { nested = true })] : []).ToDictionary());
 
-    private static string Webhook(string uuid, string type, string rrn, object amount, bool approved = true, string resultCode = "00") =>
-        $$"""{"transactionUUID":"{{uuid}}","transactionType":"{{type}}","transactionDateTime":"2026-03-04T08:02:11.417","rrn":"{{rrn}}","transactionAmount":{{amount}},"currencyCode":"ZAR","txResultCode":"{{resultCode}}","isApproved":{{(approved ? "true" : "false")}}}""";
+    private static string Webhook(string uuid, string type, string rrn, object amount, bool approved = true, string resultCode = "00", string currency = "ZAR") =>
+        $$"""{"transactionUUID":"{{uuid}}","transactionType":"{{type}}","transactionDateTime":"2026-03-04T08:02:11.417","rrn":"{{rrn}}","transactionAmount":{{amount}},"currencyCode":"{{currency}}","txResultCode":"{{resultCode}}","isApproved":{{(approved ? "true" : "false")}}}""";
 
     private static string Sign(string secret, string body) =>
         Convert.ToBase64String(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(body)));

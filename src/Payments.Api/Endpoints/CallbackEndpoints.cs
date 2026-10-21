@@ -85,7 +85,7 @@ public static class CallbackEndpoints
             || GetString(json, "txResultCode") is not { Length: > 0 } resultCode
             || !json.TryGetProperty("isApproved", out var approved) || approved.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
             || !json.TryGetProperty("transactionAmount", out var amount) || amount.ValueKind != JsonValueKind.Number
-            || !amount.TryGetInt64(out var amountMinor) || amountMinor < 0)
+            || !TryGetMinorUnits(amount, out var amountMinor))
         {
             return await RejectAsync(callbacks, EventSource.Webhook, "missing-or-invalid-fields", body, StatusCodes.Status400BadRequest, "Notification is missing or has invalid fields", cancellationToken);
         }
@@ -100,9 +100,28 @@ public static class CallbackEndpoints
                 resultCode,
                 Sast.TryParseUnzoned(GetString(json, "transactionDateTime")),
                 Encoding.UTF8.GetString(body),
-                Hash(body)),
+                Hash(body),
+                GetString(json, "currencyCode")),
             cancellationToken);
         return Results.Ok();
+    }
+
+    // A whole number is valid however it is written (1999, 1999.0, 1.999e3); a fractional minor-unit amount is not.
+    private static bool TryGetMinorUnits(JsonElement amount, out long minor)
+    {
+        minor = 0;
+        if (amount.TryGetInt64(out minor))
+        {
+            return minor >= 0;
+        }
+
+        if (!amount.TryGetDecimal(out var value) || value < 0 || value != decimal.Truncate(value) || value > long.MaxValue)
+        {
+            return false;
+        }
+
+        minor = (long)value;
+        return true;
     }
 
     private static async Task<IResult> RejectAsync(

@@ -271,6 +271,15 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             cancellationToken: cancellationToken));
     }
 
+    public async Task<PaymentTerms?> GetTermsAsync(Guid paymentId, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        return await connection.QuerySingleOrDefaultAsync<PaymentTerms>(new CommandDefinition(
+            "SELECT currency AS Currency, amount_minor AS AmountMinor, auth_amount AS AuthAmountMinor FROM payments WHERE id = @paymentId",
+            new { paymentId },
+            cancellationToken: cancellationToken));
+    }
+
     private static async Task<ApplyEventResult> InsertEventAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,

@@ -81,7 +81,7 @@ public sealed class AcmeClient(HttpClient httpClient, AcmeOptions options, TimeP
                 SubMerchantID = request.SubMerchantId,
                 MerchantCategoryCode = request.Mcc,
                 request.CardAcceptorName,
-                request.Email,
+                Email = redact ? Redacted : request.Email,
             },
         });
 

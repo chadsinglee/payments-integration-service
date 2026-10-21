@@ -22,7 +22,8 @@ public sealed record WebhookCommand(
     string ResultCode,
     DateTimeOffset? OccurredAt,
     string PayloadJson,
-    string PayloadHash);
+    string PayloadHash,
+    string? Currency = null);
 
 public enum CallbackResult
 {
@@ -99,7 +100,37 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
             command.AmountMinor);
 
         var paymentId = await store.FindPaymentIdByOrderNumberAsync(command.Rrn, cancellationToken);
+        string? invalid = null;
+        if (paymentId is not null && type is PaymentEventType.Reversal or PaymentEventType.Refund)
+        {
+            invalid = await ValidateAgainstPaymentAsync(paymentId.Value, command, cancellationToken);
+        }
+
+        if (invalid is not null)
+        {
+            // Stored for the audit trail but never applied: the payment is flagged instead of changing status.
+            logger.LogError("ALERT webhook {Reference} for payment {PaymentId} is inconsistent ({Reason}); stored, not applied", command.TransactionUuid, paymentId, invalid);
+            paymentEvent = paymentEvent with { Type = PaymentEventType.Informational };
+            return await ApplyAsync(paymentId, paymentEvent, "webhook", command.TransactionUuid, cancellationToken, flag: true);
+        }
+
         return await ApplyAsync(paymentId, paymentEvent, "webhook", command.TransactionUuid, cancellationToken);
+    }
+
+    private async Task<string?> ValidateAgainstPaymentAsync(Guid paymentId, WebhookCommand command, CancellationToken cancellationToken)
+    {
+        var terms = await store.GetTermsAsync(paymentId, cancellationToken);
+        if (terms is null)
+        {
+            return null;
+        }
+
+        if (command.Currency is not null && !string.Equals(command.Currency, terms.Currency, StringComparison.OrdinalIgnoreCase))
+        {
+            return "currency-mismatch";
+        }
+
+        return command.AmountMinor > (terms.AuthAmountMinor ?? terms.AmountMinor) ? "amount-exceeds-payment" : null;
     }
 
     private async Task<CallbackResult> ApplyAsync(
@@ -107,7 +138,8 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
         NewPaymentEvent paymentEvent,
         string kind,
         string reference,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool flag = false)
     {
         if (paymentId is null)
         {
@@ -124,7 +156,9 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
             return CallbackResult.Unmatched;
         }
 
-        var result = await outcomes.ApplyAsync(paymentId.Value, paymentEvent, cancellationToken);
+        var result = flag
+            ? await outcomes.ApplyAsync(paymentId.Value, paymentEvent, static (_, update) => update with { NeedsInvestigation = true }, cancellationToken)
+            : await outcomes.ApplyAsync(paymentId.Value, paymentEvent, cancellationToken);
         if (result == ApplyEventResult.Conflict)
         {
             logger.LogError("ALERT {Kind} {Reference} was redelivered with a different payload; payment {PaymentId} flagged", kind, reference, paymentId);

@@ -75,6 +75,24 @@ public class AcmeOutcomeClassifierTests
     [InlineData("Failure", "E22", "Acquirer", PaymentEventType.Declined)]
     [InlineData("Failure", "00", "Acquirer", PaymentEventType.Informational)]
     [InlineData("Other", "99", "Acquirer", PaymentEventType.Informational)]
-    public void ClassifyAdvice_WhenStatusAndCodeGiven_MapsToTheEventType(string status, string code, string source, PaymentEventType expected) =>
+    [InlineData("Success", "PEND", "EFT", PaymentEventType.Informational)]
+    [InlineData("Failure", "PEND", "EFT", PaymentEventType.Informational)]
+    [InlineData("Success", "PEND", "Acquirer", PaymentEventType.Informational)]
+    [InlineData("Success", "COMPL", "EFT", PaymentEventType.Approved)]
+    [InlineData("Failure", "COMPL", "EFT", PaymentEventType.Informational)]
+    [InlineData("Success", "COMPL", "Acquirer", PaymentEventType.Informational)]
+    [InlineData("Success", "COMPL", null, PaymentEventType.Informational)]
+    public void ClassifyAdvice_WhenStatusAndCodeGiven_MapsToTheEventType(string status, string code, string? source, PaymentEventType expected) =>
         AcmeOutcomeClassifier.ClassifyAdvice(status, code, source).ShouldBe(expected);
+
+    [Theory]
+    [InlineData("PEND", "Success", "EFT", PaymentEventType.OutcomeUnknown)]
+    [InlineData("PEND", "Success", "Acquirer", PaymentEventType.OutcomeUnknown)]
+    [InlineData("COMPL", "Success", "EFT", PaymentEventType.Approved)]
+    [InlineData("COMPL", "Failure", "EFT", PaymentEventType.OutcomeUnknown)]
+    [InlineData("COMPL", "Success", "Acquirer", PaymentEventType.OutcomeUnknown)]
+    [InlineData("COMPL", "Success", null, PaymentEventType.OutcomeUnknown)]
+    [InlineData("05", "Success", "Acquirer", PaymentEventType.Declined)]
+    public void ClassifyProcessed_WhenCodeIsPendingOrCompleted_IsNotADecline(string code, string status, string? source, PaymentEventType expected) =>
+        AcmeOutcomeClassifier.ClassifyProcessed(code, status, source).Type.ShouldBe(expected);
 }

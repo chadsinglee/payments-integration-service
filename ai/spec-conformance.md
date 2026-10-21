@@ -1,6 +1,6 @@
 # Spec conformance (final check)
 
-Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 134 unit and 128 integration tests, and `dotnet format --verify-no-changes` were run after the last change; the Docker Compose smoke test passed (see `ai/sessions/slice-9-hardening.md`).
+Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 148 unit and 135 integration tests, and `dotnet format --verify-no-changes` were run after the last change (post-review fixes: webhook amount parsing, reversal/refund validation, PEND/COMPL classification, audit email redaction, localhost-only Compose ports); the Docker Compose smoke test passed before those fixes and was not re-run (see `ai/sessions/slice-9-hardening.md`).
 
 ## Functional requirements
 | # | Requirement | Code | Proof | Status |
@@ -37,10 +37,10 @@ Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.
 | N8 | AWS approach incl. graceful shutdown | met | `SOLUTION.md` 8; shutdown settings tested |
 | D1 | Source code | met | |
 | D2 | `SOLUTION.md` complete | met | sections 1-11 |
-| D3 | AI config in tool-expected locations | partial | present on disk; the repo has no commit yet (user asked for none) |
+| D3 | AI config in tool-expected locations | met | `AGENTS.md`, `.github/` committed on branch `feature/payments-submission` |
 | D4 | `ai/` directory | met | plan, sessions, this file |
 | D5 | Exported Acme-client sessions | met, with limits | `ai/transcripts/` holds redacted, mechanically converted transcripts of the whole build session, bootstrap and slices 1-9 plus the close-out (full prompts, answers, assistant text, tool calls and results, see `ai/transcripts/README.md`). `ai/sessions/` holds curated summaries for slices 6-9 only; slices 1-5 have no curated summary, their transcripts are the record. Limits: tool output and arguments over 4000 characters are cut, hidden reasoning and system prompts are not included, and the turn that wrote the export is not in it. The checkpoint summaries are not part of the record |
-| D6 | Single GitHub repository | missing | nothing committed or pushed; needs the user |
+| D6 | Single GitHub repository | met, with limits | branch `feature/payments-submission` is pushed to `chadsinglee/payments-integration-service`; the remote has no `main` yet, so no pull request exists |
 | D7 | 5-10 minute video | missing | owner: user |
 | D8 | Personal info removed from sessions | unverifiable | records written without names or paths |
 

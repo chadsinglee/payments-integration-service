@@ -15,6 +15,16 @@ public sealed record AcmeOutcome(PaymentEventType Type, AcmeAlert Alert = AcmeAl
 public static class AcmeOutcomeClassifier
 {
     private const string Approved = "00";
+    private const string Completed = "COMPL";
+    private const string Pending = "PEND";
+
+    private const string EftSource = "EFT";
+
+    // COMPL is an EFT collection result; on any other source it is unexpected and must not approve.
+    private static bool IsApprovedCode(string code, string? source) => code == Approved || (code == Completed && source == EftSource);
+
+    // Not a final answer: PEND, or COMPL from a non-EFT source (neither approved nor declined).
+    private static bool IsNonFinal(string code, string? source) => code == Pending || (code == Completed && source != EftSource);
 
     public static AcmeOutcome Classify(AcmePaymentRequest request, AcmePostResult result)
     {
@@ -41,7 +51,12 @@ public static class AcmeOutcomeClassifier
             return PaymentEventType.Informational;
         }
 
-        if (responseCode == Approved)
+        if (IsNonFinal(responseCode, responseSource))
+        {
+            return PaymentEventType.Informational;
+        }
+
+        if (IsApprovedCode(responseCode, responseSource))
         {
             return transactionStatus == "Success" ? PaymentEventType.Approved : PaymentEventType.Informational;
         }
@@ -61,7 +76,13 @@ public static class AcmeOutcomeClassifier
             return new AcmeOutcome(PaymentEventType.OutcomeUnknown);
         }
 
-        if (code == Approved)
+        // Not final (PEND, or COMPL outside EFT): the outcome stays unknown and reconciliation keeps asking.
+        if (IsNonFinal(code, responseSource))
+        {
+            return new AcmeOutcome(PaymentEventType.OutcomeUnknown);
+        }
+
+        if (IsApprovedCode(code, responseSource))
         {
             return new AcmeOutcome(transactionStatus == "Success" ? PaymentEventType.Approved : PaymentEventType.OutcomeUnknown);
         }

@@ -48,6 +48,7 @@ public sealed class AcmeClientTests
         var result = await provider.GetRequiredService<IAcmeClient>().SubmitPaymentAsync(Request, CancellationToken.None);
 
         result.RedactedRequestJson.ShouldNotContain(CardToken);
+        result.RedactedRequestJson.ShouldNotContain(Request.Email);
         result.RedactedRequestJson.ShouldNotContain(ApiKey);
     }
 

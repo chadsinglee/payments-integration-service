@@ -56,6 +56,9 @@ public interface IPaymentStore
 
     Task<Guid?> FindPaymentIdByOrderNumberAsync(string orderNumber, CancellationToken cancellationToken);
 
+    /// <summary>Currency and amounts a later reversal or refund must stay within; both are fixed once the payment exists.</summary>
+    Task<PaymentTerms?> GetTermsAsync(Guid paymentId, CancellationToken cancellationToken);
+
     Task RecordInteractionAsync(AcmeInteraction interaction, CancellationToken cancellationToken);
 
     /// <summary>
