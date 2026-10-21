@@ -1,0 +1,82 @@
+# Local development only. Values below are throwaway defaults; override via environment or a .env file (never commit real secrets).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments-local-dev}
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  stub:
+    build:
+      context: .
+      dockerfile: src/Acme.Stub/Dockerfile
+    environment:
+      Stub__ApiKey: ${ACME_API_KEY:-sk_test_stub}
+      Stub__CallbackBaseUrl: http://api:8080/
+      Stub__MerchantId: ${ACME_MERCHANT_ID:-MID-LOCAL}
+      Stub__AdviceUsername: ${ACME_ADVICE_USERNAME:-local-advice-user}
+      Stub__AdvicePassword: ${ACME_ADVICE_PASSWORD:-local-advice-password}
+      Stub__WebhookSecret: ${ACME_WEBHOOK_SECRET:-local-webhook-secret}
+    ports:
+      - "5002:8080"
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Payments.Api/Dockerfile
+    environment:
+      ConnectionStrings__Payments: Host=postgres;Port=5432;Database=payments;Username=payments;Password=${POSTGRES_PASSWORD:-payments-local-dev}
+      Database__MigrateOnStartup: "true"
+      Database__SeedDemoData: ${SEED_DEMO_DATA:-true}
+      Acme__MerchantId: ${ACME_MERCHANT_ID:-MID-LOCAL}
+      Acme__AdviceUsername: ${ACME_ADVICE_USERNAME:-local-advice-user}
+      Acme__AdvicePassword: ${ACME_ADVICE_PASSWORD:-local-advice-password}
+      Acme__WebhookSecret: ${ACME_WEBHOOK_SECRET:-local-webhook-secret}
+    ports:
+      - "5001:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/Payments.Worker/Dockerfile
+    environment:
+      ConnectionStrings__Payments: Host=postgres;Port=5432;Database=payments;Username=payments;Password=${POSTGRES_PASSWORD:-payments-local-dev}
+      Acme__BaseUrl: http://stub:8080/
+      ConnectionStrings__Redis: redis:6379
+      Acme__ApiKey: ${ACME_API_KEY:-sk_test_stub}
+      Acme__MerchantId: ${ACME_MERCHANT_ID:-MID-LOCAL}
+    # Longer than the Acme timeout (40 s) plus the host's 15 s margin, so an in-flight call is recorded before SIGKILL.
+    stop_grace_period: 60s
+    depends_on:
+      api:
+        condition: service_healthy
+      stub:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
