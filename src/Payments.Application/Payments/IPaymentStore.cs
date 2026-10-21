@@ -52,6 +52,23 @@ public interface IPaymentStore
     /// <summary>Stores a callback that matches no payment (payment_id null) so it is never lost.</summary>
     Task<ApplyEventResult> RecordUnmatchedEventAsync(NewPaymentEvent paymentEvent, CancellationToken cancellationToken);
 
+    /// <summary>Unmatched webhook events whose next retry is due and that are not yet exhausted.</summary>
+    Task<IReadOnlyList<UnmatchedWebhook>> FindDueUnmatchedWebhooksAsync(int limit, TimeSpan backoffBase, TimeSpan backoffCap, CancellationToken cancellationToken);
+
+    /// <summary>Counts one failed match attempt; <paramref name="exhausted"/> stops further attempts.</summary>
+    Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Attaches a stored unmatched event to its payment and recomputes the status, in one transaction under the payment's row lock
+    /// (the same recompute as <see cref="ApplyEventAsync"/>). Skipped when the event was already adopted.
+    /// </summary>
+    Task<ApplyEventResult> AdoptUnmatchedEventAsync(
+        long eventId,
+        Guid paymentId,
+        PaymentEventType type,
+        Func<PaymentState, IReadOnlyCollection<PaymentEventFact>, PaymentUpdate> decide,
+        CancellationToken cancellationToken);
+
     Task<Guid?> FindPaymentIdByTransactionIdAsync(Guid transactionId, CancellationToken cancellationToken);
 
     Task<Guid?> FindPaymentIdByOrderNumberAsync(string orderNumber, CancellationToken cancellationToken);

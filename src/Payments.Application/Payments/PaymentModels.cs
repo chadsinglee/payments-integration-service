@@ -52,6 +52,8 @@ public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? Au
 
 public sealed record PaymentTerms(string Currency, long AmountMinor, long? AuthAmountMinor);
 
+public sealed record UnmatchedWebhook(long EventId, string? Rrn, PaymentEventType Type, long? AmountMinor, string? Currency, int Attempts, DateTimeOffset ReceivedAt);
+
 public sealed record PaymentUpdate(
     PaymentStatus Status,
     long? AuthAmountMinor,

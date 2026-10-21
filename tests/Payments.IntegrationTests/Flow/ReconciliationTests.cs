@@ -134,6 +134,42 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Reconcile_WhenTheResendIsNotSeenEither_DelaysTheNextResendInsteadOfLooping()
+    {
+        await Post("pay-1", StubAmounts.GatewayError);
+        using var harness = new WorkerHarness(_connectionString, _stub);
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await MakeDue();
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await MakeDue();
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        (await Row("pay-1")).Status.ShouldBe("Pending");
+        (await Scalar<bool>("SELECT next_attempt_at > now() + interval '5 seconds' FROM payments")).ShouldBeTrue();
+        (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenTheMaxAttemptsAreUsedInsideTheWindow_StopsFlaggedAndStaysUnknown()
+    {
+        await Post("pay-1", StubAmounts.GatewayError);
+        using var harness = new WorkerHarness(_connectionString, _stub);
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await Execute($"UPDATE payments SET rttq_attempts = {ReconciliationSettings.Default.MaxAttempts - 1}, next_attempt_at = now() - interval '1 second'");
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Unknown");
+        row.NeedsInvestigation.ShouldBeTrue();
+        row.ReconciliationState.ShouldBe("Exhausted");
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(1);
+    }
+
+    [Fact]
     public async Task RecoverExpiredLeases_WhenAWorkerDiedMidSubmit_MarksTheOutcomeUnknownOnce()
     {
         await Post("pay-1", 5_000);
@@ -379,6 +415,8 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     private static class StubAmounts
     {
         public const long FirstPostFails = 99_502;
+
+        public const long GatewayError = 99_503;
     }
 
     private sealed class LoseResponseHandler(HttpMessageHandler inner) : DelegatingHandler(inner)

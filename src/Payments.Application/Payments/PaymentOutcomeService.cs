@@ -25,6 +25,45 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
         CancellationToken cancellationToken) =>
         ApplyAsync(paymentId, paymentEvent, static (_, update) => update, precondition, cancellationToken);
 
+    /// <summary>Why a reversal/refund contradicts its payment (currency mismatch, amount above what was authorised), or null when consistent.</summary>
+    public async Task<string?> ValidateReversalAsync(Guid paymentId, string? currency, long? amountMinor, CancellationToken cancellationToken)
+    {
+        var terms = await store.GetTermsAsync(paymentId, cancellationToken);
+        if (terms is null)
+        {
+            return null;
+        }
+
+        if (currency is not null && !string.Equals(currency, terms.Currency, StringComparison.OrdinalIgnoreCase))
+        {
+            return "currency-mismatch";
+        }
+
+        return amountMinor > (terms.AuthAmountMinor ?? terms.AmountMinor) ? "amount-exceeds-payment" : null;
+    }
+
+    /// <summary>
+    /// Attaches a stored unmatched event to its payment through the same recompute as a live event.
+    /// <paramref name="flag"/> marks the payment for investigation (the event failed validation and was downgraded).
+    /// </summary>
+    public Task<ApplyEventResult> AdoptAsync(long eventId, Guid paymentId, PaymentEventType type, bool flag, CancellationToken cancellationToken) =>
+        store.AdoptUnmatchedEventAsync(
+            eventId,
+            paymentId,
+            type,
+            (state, facts) =>
+            {
+                var decision = PaymentStatusRules.Recompute(state.Status, state.AuthAmountMinor, type, facts);
+                var needsInvestigation = decision.NeedsInvestigation || flag;
+                if (needsInvestigation && !state.NeedsInvestigation)
+                {
+                    logger.LogError("ALERT payment {PaymentId} flagged for investigation after late {EventType} (status {Status})", paymentId, type, decision.Status);
+                }
+
+                return new PaymentUpdate(decision.Status, state.AuthAmountMinor, needsInvestigation);
+            },
+            cancellationToken);
+
     private Task<ApplyEventResult> ApplyAsync(
         Guid paymentId,
         NewPaymentEvent paymentEvent,

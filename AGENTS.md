@@ -14,6 +14,7 @@ All commands verified (slice 9). The SDK is pinned to 8.0.x via `global.json`.
 | Build | `dotnet build Payments.sln` |
 | Unit tests (no external infra) | `dotnet test tests/Payments.UnitTests` |
 | Integration tests (need Docker/DB) | `dotnet test tests/Payments.IntegrationTests` |
+| Customer simulation (needs the stack running, see `docs/customer-simulation-spec.md`) | `dotnet test tests/Payments.CustomerSimulation` |
 | Lint / format | `dotnet format Payments.sln --verify-no-changes` |
 | Run locally | `docker compose up --build -d` (Api on :5001, stub on :5002) |
 

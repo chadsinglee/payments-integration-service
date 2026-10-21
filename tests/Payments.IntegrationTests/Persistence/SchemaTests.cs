@@ -132,6 +132,69 @@ public class SchemaTests(PostgresFixture postgres)
     }
 
     [Fact]
+    public async Task PaymentEvents_WhenAnUnmatchedEventGainsItsPayment_OnlyThatEditIsAllowed()
+    {
+        await using var connection = await OpenAsync();
+        var paymentId = await InsertPaymentAsync(connection);
+        var otherPaymentId = await InsertPaymentAsync(connection);
+        var eventId = await InsertUnmatchedEventAsync(connection, "k-1");
+
+        // Rejected: type-only change, adoption together with any other column, adoption to a type other than Informational.
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET event_type = 7 WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, payload_hash = 'x' WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, payload = '{\"a\":1}' WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, amount_minor = 5 WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, occurred_at = now() WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, dedup_key = 'k-2' WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, source = 2 WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, event_type = 5 WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("DELETE FROM payment_events WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        (await connection.ExecuteScalarAsync<int>("SELECT count(*) FROM payment_events WHERE id = @eventId AND payment_id IS NULL AND event_type = 6", new { eventId })).ShouldBe(1);
+
+        // Allowed: adoption alone.
+        (await connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId WHERE id = @eventId", new { paymentId, eventId })).ShouldBe(1);
+
+        // Once adopted nothing may change: re-pointing, clearing, or a type change.
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @otherPaymentId WHERE id = @eventId", new { otherPaymentId, eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = NULL WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET event_type = 7 WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("DELETE FROM payment_events WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("TRUNCATE payment_events"), RaisedByTrigger);
+    }
+
+    [Fact]
+    public async Task PaymentEvents_WhenAnUnmatchedEventFailsValidation_CanBeAdoptedAsInformational()
+    {
+        await using var connection = await OpenAsync();
+        var paymentId = await InsertPaymentAsync(connection);
+        var eventId = await InsertUnmatchedEventAsync(connection, "k-1");
+
+        (await connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, event_type = 7 WHERE id = @eventId", new { paymentId, eventId })).ShouldBe(1);
+    }
+
+    [Fact]
+    public async Task PaymentEvents_WhenAColumnIsAddedLater_AdoptionStillCannotChangeIt()
+    {
+        // Own database: the temporary column must not leak into the shared one.
+        await using var connection = new NpgsqlConnection(await postgres.CreateIsolatedDatabaseAsync());
+        await connection.OpenAsync();
+        await connection.ExecuteAsync("ALTER TABLE payment_events ADD COLUMN later_added TEXT NULL");
+        var paymentId = await InsertPaymentAsync(connection);
+        var eventId = await InsertUnmatchedEventAsync(connection, "k-1");
+
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId, later_added = 'x' WHERE id = @eventId", new { paymentId, eventId }), RaisedByTrigger);
+        (await connection.ExecuteAsync("UPDATE payment_events SET payment_id = @paymentId WHERE id = @eventId", new { paymentId, eventId })).ShouldBe(1);
+
+        await ShouldFailWithAsync(() => connection.ExecuteAsync("UPDATE payment_events SET later_added = 'y' WHERE id = @eventId", new { eventId }), RaisedByTrigger);
+        await connection.ExecuteAsync("ALTER TABLE payment_events DROP COLUMN later_added");
+    }
+
+    private static Task<long> InsertUnmatchedEventAsync(NpgsqlConnection connection, string key) =>
+        connection.ExecuteScalarAsync<long>(
+            "INSERT INTO payment_events (payment_id, source, event_type, dedup_key, payload_hash, payload, amount_minor) VALUES (NULL, 3, 6, @key || '-' || gen_random_uuid()::text, 'h', '{}', 100) RETURNING id",
+            new { key });
+
+    [Fact]
     public async Task AcmeInteractions_WhenUpdatedDeletedOrTruncated_AreRejected()
     {
         await using var connection = await OpenAsync();

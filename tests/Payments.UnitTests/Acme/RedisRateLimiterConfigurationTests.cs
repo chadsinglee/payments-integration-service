@@ -15,9 +15,9 @@ public class RedisRateLimiterConfigurationTests
             .Build();
 
     [Fact]
-    public void Read_WhenNothingIsConfigured_DefaultsTo18()
+    public void Read_WhenNothingIsConfigured_DefaultsTo15()
     {
-        RedisRateLimiterConfiguration.Read(Config(null)).LimitPerSecond.ShouldBe(18);
+        RedisRateLimiterConfiguration.Read(Config(null)).LimitPerSecond.ShouldBe(15);
     }
 
     [Theory]

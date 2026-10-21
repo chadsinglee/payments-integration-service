@@ -15,14 +15,15 @@ Compose uses throwaway local defaults (override with `POSTGRES_PASSWORD`, `ACME_
 
 | Variable | Host | Notes |
 |---|---|---|
-| `ConnectionStrings__Payments` | Api, Worker | Required. Postgres connection string |
+| `ConnectionStrings__Payments` | Api, Worker | Required. Postgres connection string. `Maximum Pool Size` defaults to 40 per process (Api plus Worker stay under Postgres' 100 connections); set it in the string to override |
 | `Acme__BaseUrl`, `Acme__ApiKey`, `Acme__MerchantId` | Worker | Required. Startup fails naming missing keys, never printing values |
 | `Acme__TimeoutSeconds` | Worker | Default 40 (Acme can hold a request up to 30 s); must be > 0 |
 | `Acme__MerchantId`, `Acme__AdviceUsername`, `Acme__AdvicePassword`, `Acme__WebhookSecret` | Api | Required for `POST /acme/advice` (HTTP Basic + `MerchantID` match) and `POST /acme/webhook` (`x-signature` HMAC-SHA256). Startup fails naming missing keys. Compose defaults are local-only placeholders |
 | `Worker__Concurrency`, `Worker__PollIntervalMs`, `Worker__LeaseMarginSeconds` | Worker | Defaults 4, 500, 30; all >= 1 |
-| `Reconciliation__ResendWindowMinutes`, `PendingExpiryMinutes`, `MaxAttempts`, `BackoffSeconds`, `BackoffCapSeconds` | Worker | Defaults 10, 15, 8, 10, 300; all >= 1 (cap >= backoff). Resend window: an RTTQ 404 within it resubmits with the same `TransactionID` |
+| `Reconciliation__ResendWindowMinutes`, `PendingExpiryMinutes`, `MaxAttempts`, `BackoffSeconds`, `BackoffCapSeconds` | Worker | Defaults 10, 15, 8, 10, 300; all >= 1 (cap >= backoff). Resend window: an RTTQ 404 within it resubmits with the same `TransactionID` (the first resend at once, later ones with backoff, and no more than `MaxAttempts`) |
+| `Reconciliation__UnmatchedMaxAttempts`, `Reconciliation__UnmatchedMaxAgeMinutes` | Worker | Defaults 12, 60; both >= 1. A reversal/refund webhook that arrived before its payment is retried against `order_number` until it matches (then applied once) or either limit is hit (then it stops and logs an `ALERT`) |
 | `ConnectionStrings__Redis` | Worker | Required. Redis for the shared Acme rate limit (POST and RTTQ combined) |
-| `Acme__RateLimitPerSecond` | Worker | Default 18, range 1-19 (Acme rejects more than 20 per second across all workers; 20 or more is refused at startup). A 429 also sets a Redis cooldown honoured by every worker |
+| `Acme__RateLimitPerSecond` | Worker | Default 15, range 1-19 (Acme rejects more than 20 per second across all workers; 20 or more is refused at startup). A 429 also sets a Redis cooldown honoured by every worker |
 | `Throttle__FailureThreshold`, `BreakerOpenSeconds`, `UnauthorizedPauseSeconds` | Worker | Defaults 5, 30, 60; all >= 1. Breaker opens after that many consecutive 5xx/timeouts, then admits one probe call before closing; a 401 pauses for the unauthorized period |
 | `Database__MigrateOnStartup`, `Database__SeedDemoData` | Api | Defaults true, false |
 | `Summary__CutoffHours` | Api | Default 12, range 0-720. A SAST day is final this long after it ends; later events still count on their own day and are reported as late |

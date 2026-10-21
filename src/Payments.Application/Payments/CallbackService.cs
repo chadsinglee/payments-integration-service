@@ -117,21 +117,8 @@ public sealed class CallbackService(IPaymentStore store, PaymentOutcomeService o
         return await ApplyAsync(paymentId, paymentEvent, "webhook", command.TransactionUuid, cancellationToken);
     }
 
-    private async Task<string?> ValidateAgainstPaymentAsync(Guid paymentId, WebhookCommand command, CancellationToken cancellationToken)
-    {
-        var terms = await store.GetTermsAsync(paymentId, cancellationToken);
-        if (terms is null)
-        {
-            return null;
-        }
-
-        if (command.Currency is not null && !string.Equals(command.Currency, terms.Currency, StringComparison.OrdinalIgnoreCase))
-        {
-            return "currency-mismatch";
-        }
-
-        return command.AmountMinor > (terms.AuthAmountMinor ?? terms.AmountMinor) ? "amount-exceeds-payment" : null;
-    }
+    private Task<string?> ValidateAgainstPaymentAsync(Guid paymentId, WebhookCommand command, CancellationToken cancellationToken) =>
+        outcomes.ValidateReversalAsync(paymentId, command.Currency, command.AmountMinor, cancellationToken);
 
     private async Task<CallbackResult> ApplyAsync(
         Guid? paymentId,

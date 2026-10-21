@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace Payments.Application.Payments;
@@ -16,7 +17,8 @@ public enum RateLimitStatus
     CoolingDown,
 }
 
-public readonly record struct RateLimitResult(RateLimitStatus Status, TimeSpan Wait = default);
+/// <param name="GrantedAtUnixMs">Redis's own clock at the moment it granted the token (0 when not granted or not known).</param>
+public readonly record struct RateLimitResult(RateLimitStatus Status, TimeSpan Wait = default, long GrantedAtUnixMs = 0);
 
 /// <summary>global-rate-limit: one Acme budget (POST and RTTQ combined) shared by every worker.</summary>
 public interface IAcmeRateLimiter
@@ -52,7 +54,9 @@ public enum AcmeSignalKind
 public readonly record struct AcmeSignal(AcmeSignalKind Kind, TimeSpan Delay = default);
 
 /// <param name="Probe">This call is the single half-open probe; its result decides whether calls resume.</param>
-public readonly record struct GateAdmission(bool Granted, TimeSpan RetryAfter = default, bool Probe = false);
+/// <param name="GrantedAt">Stopwatch timestamp of the token grant; lets <see cref="AcmeGate.LogDispatch"/> report how long the token waited before the call.</param>
+/// <param name="RedisGrantedAtUnixMs">Redis's clock at the grant, to compare with the dispatch time and with Acme's arrival time.</param>
+public readonly record struct GateAdmission(bool Granted, TimeSpan RetryAfter = default, bool Probe = false, long GrantedAt = 0, long RedisGrantedAtUnixMs = 0);
 
 /// <summary>
 /// acme-rate-limit, acme-401 and the circuit breaker in one place. The breaker is per worker process: it opens after repeated
@@ -131,6 +135,24 @@ public sealed class AcmeGate(IAcmeRateLimiter limiter, AcmeGateSettings settings
         }
     }
 
+    /// <summary>
+    /// Debug diagnostics for rate-limit overshoot: the budget counts grants, Acme counts arrivals, so the gap between the two shows
+    /// whether tokens are used late or bunch up. Compare the UTC dispatch time with the stub's receivedAt.
+    /// </summary>
+    public void LogDispatch(GateAdmission admission, string call)
+    {
+        if (logger.IsEnabled(LogLevel.Debug))
+        {
+            logger.LogDebug(
+                "Acme {Call} dispatched at {DispatchedAt:O}, {GrantToDispatchMs:F1} ms after its rate-limit token was granted (Redis granted at {RedisGrantedAtUnixMs} Unix ms, dispatched at {DispatchedAtUnixMs})",
+                call,
+                timeProvider.GetUtcNow(),
+                Stopwatch.GetElapsedTime(admission.GrantedAt).TotalMilliseconds,
+                admission.RedisGrantedAtUnixMs,
+                timeProvider.GetUtcNow().ToUnixTimeMilliseconds());
+        }
+    }
+
     /// <summary>Gives the probe slot back when the admitted call never reached Acme (claim lost, request could not be built).</summary>
     public void AbandonProbe(GateAdmission admission)
     {
@@ -159,7 +181,7 @@ public sealed class AcmeGate(IAcmeRateLimiter limiter, AcmeGateSettings settings
             switch (result.Status)
             {
                 case RateLimitStatus.Granted:
-                    return new GateAdmission(true);
+                    return new GateAdmission(true, GrantedAt: Stopwatch.GetTimestamp(), RedisGrantedAtUnixMs: result.GrantedAtUnixMs);
                 case RateLimitStatus.Unavailable:
                     Pause(settings.LimiterUnavailablePause, "rate limiter unavailable");
                     return new GateAdmission(false, settings.LimiterUnavailablePause);

@@ -75,6 +75,7 @@ public sealed class PaymentSubmissionService(
             throw;
         }
 
+        gate.LogDispatch(admission, "POST");
         var result = await acmeClient.SubmitPaymentAsync(request, CancellationToken.None);
 
         // 401 and 429 mean Acme processed nothing, so the payment goes back to Pending (same TransactionID, a new MessageID next time).

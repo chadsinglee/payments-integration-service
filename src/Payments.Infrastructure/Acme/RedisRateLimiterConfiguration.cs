@@ -4,8 +4,9 @@ namespace Payments.Infrastructure.Acme;
 
 public static class RedisRateLimiterConfiguration
 {
-    /// <summary>Acme allows 20 requests per second; the default leaves headroom for clock and latency jitter, and 20 itself is refused.</summary>
-    public const int DefaultLimitPerSecond = 18;
+    /// <summary>Acme allows 20 requests per second; the default leaves headroom for clock and latency jitter, and 20 itself is refused.
+    /// 18 was observed to let 21-22 arrive in a one-second window during a burst (see docs/simulation-traceability.md), hence 15.</summary>
+    public const int DefaultLimitPerSecond = 15;
 
     public const int MaxLimitPerSecond = 19;
 

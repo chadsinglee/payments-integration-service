@@ -206,7 +206,91 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             return outcome;
         }
 
-        var facts = (await connection.QueryAsync<FactRow>(new CommandDefinition(
+        var facts = await LoadFactsAsync(connection, transaction, paymentId, cancellationToken);
+
+        var update = decide(state, facts);
+        await WriteUpdateAsync(connection, transaction, paymentId, update, cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+        return ApplyEventResult.Applied;
+    }
+
+    public async Task<ApplyEventResult> AdoptUnmatchedEventAsync(
+        long eventId,
+        Guid paymentId,
+        PaymentEventType type,
+        Func<PaymentState, IReadOnlyCollection<PaymentEventFact>, PaymentUpdate> decide,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+        var current = await connection.QuerySingleAsync<StateRow>(new CommandDefinition(
+            "SELECT status AS Status, auth_amount AS AuthAmount, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
+            new { paymentId },
+            transaction,
+            cancellationToken: cancellationToken));
+        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation);
+
+        // Under the payment's row lock; a concurrent sweep that already adopted the event leaves nothing to do.
+        var adopted = await connection.ExecuteAsync(new CommandDefinition(
+            "UPDATE payment_events SET payment_id = @paymentId, event_type = @eventType WHERE id = @eventId AND payment_id IS NULL",
+            new { paymentId, eventId, eventType = (short)type },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (adopted == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return ApplyEventResult.Skipped;
+        }
+
+        var facts = await LoadFactsAsync(connection, transaction, paymentId, cancellationToken);
+        await WriteUpdateAsync(connection, transaction, paymentId, decide(state, facts), cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+        return ApplyEventResult.Applied;
+    }
+
+    public async Task<IReadOnlyList<UnmatchedWebhook>> FindDueUnmatchedWebhooksAsync(int limit, TimeSpan backoffBase, TimeSpan backoffCap, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        var rows = await connection.QueryAsync<UnmatchedRow>(new CommandDefinition(
+            """
+            SELECT e.id AS EventId, e.payload->>'rrn' AS Rrn, e.event_type AS TypeValue, e.amount_minor AS AmountMinor,
+                   e.payload->>'currencyCode' AS Currency, COALESCE(s.attempts, 0) AS Attempts, e.received_at AS ReceivedAt
+            FROM payment_events e
+            LEFT JOIN unmatched_event_sweeps s ON s.event_id = e.id
+            WHERE e.payment_id IS NULL AND e.source = 3 AND s.exhausted_at IS NULL
+              AND (s.last_attempt_at IS NULL
+                   OR s.last_attempt_at + make_interval(secs => LEAST(@capSeconds, @baseSeconds * power(2, GREATEST(s.attempts - 1, 0)))) <= now())
+            ORDER BY e.id
+            LIMIT @limit
+            """,
+            new { limit, baseSeconds = backoffBase.TotalSeconds, capSeconds = backoffCap.TotalSeconds },
+            cancellationToken: cancellationToken));
+        return rows
+            .Select(row => new UnmatchedWebhook(row.EventId, row.Rrn, (PaymentEventType)row.TypeValue, row.AmountMinor, row.Currency, row.Attempts, row.ReceivedAt))
+            .ToList();
+    }
+
+    public async Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO unmatched_event_sweeps (event_id, attempts, last_attempt_at, exhausted_at)
+            VALUES (@eventId, 1, now(), CASE WHEN @exhausted THEN now() END)
+            ON CONFLICT (event_id) DO UPDATE
+            SET attempts = unmatched_event_sweeps.attempts + 1,
+                last_attempt_at = now(),
+                exhausted_at = CASE WHEN @exhausted THEN now() ELSE unmatched_event_sweeps.exhausted_at END
+            """,
+            new { eventId, exhausted },
+            cancellationToken: cancellationToken));
+    }
+
+    private static async Task<List<PaymentEventFact>> LoadFactsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid paymentId, CancellationToken cancellationToken) =>
+        (await connection.QueryAsync<FactRow>(new CommandDefinition(
             "SELECT id AS Id, event_type AS EventType, amount_minor AS AmountMinor, occurred_at AS OccurredAt FROM payment_events WHERE payment_id = @paymentId",
             new { paymentId },
             transaction,
@@ -214,9 +298,8 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             .Select(row => new PaymentEventFact(row.Id, (PaymentEventType)row.EventType, row.AmountMinor, row.OccurredAt))
             .ToList();
 
-        var update = decide(state, facts);
-
-        await connection.ExecuteAsync(new CommandDefinition(
+    private static Task WriteUpdateAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid paymentId, PaymentUpdate update, CancellationToken cancellationToken) =>
+        connection.ExecuteAsync(new CommandDefinition(
             """
             UPDATE payments
             SET status = @status,
@@ -239,10 +322,6 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             },
             transaction,
             cancellationToken: cancellationToken));
-
-        await transaction.CommitAsync(cancellationToken);
-        return ApplyEventResult.Applied;
-    }
 
     public async Task<ApplyEventResult> RecordUnmatchedEventAsync(NewPaymentEvent paymentEvent, CancellationToken cancellationToken)
     {
@@ -487,6 +566,23 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         public long? AmountMinor { get; init; }
 
         public DateTimeOffset? OccurredAt { get; init; }
+    }
+
+    private sealed class UnmatchedRow
+    {
+        public long EventId { get; init; }
+
+        public string? Rrn { get; init; }
+
+        public short TypeValue { get; init; }
+
+        public long? AmountMinor { get; init; }
+
+        public string? Currency { get; init; }
+
+        public int Attempts { get; init; }
+
+        public DateTimeOffset ReceivedAt { get; init; }
     }
 
     private sealed class StateRow

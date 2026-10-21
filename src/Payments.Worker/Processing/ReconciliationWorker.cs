@@ -25,6 +25,7 @@ public sealed class ReconciliationWorker(
             {
                 var swept = sweeps
                     ? await reconciliation.RecoverExpiredLeasesAsync(stoppingToken) + await reconciliation.ExpireStalePendingAsync(stoppingToken)
+                        + await reconciliation.AdoptUnmatchedWebhooksAsync(stoppingToken)
                     : 0;
                 var reconciled = await reconciliation.ReconcileNextAsync(lease, stoppingToken);
                 if (swept == 0 && !reconciled)

@@ -14,11 +14,14 @@ public static class ReconciliationConfiguration
         var maxAttempts = section.GetValue("MaxAttempts", defaults.MaxAttempts);
         var backoffSeconds = section.GetValue("BackoffSeconds", (int)defaults.BackoffBase.TotalSeconds);
         var backoffCapSeconds = section.GetValue("BackoffCapSeconds", (int)defaults.BackoffCap.TotalSeconds);
+        var unmatchedMaxAttempts = section.GetValue("UnmatchedMaxAttempts", defaults.UnmatchedMaxAttempts);
+        var unmatchedMaxAgeMinutes = section.GetValue("UnmatchedMaxAgeMinutes", defaults.UnmatchedMaxAgeMinutes);
 
-        if (resendMinutes < 1 || expiryMinutes < 1 || maxAttempts < 1 || backoffSeconds < 1 || backoffCapSeconds < backoffSeconds)
+        if (resendMinutes < 1 || expiryMinutes < 1 || maxAttempts < 1 || backoffSeconds < 1 || backoffCapSeconds < backoffSeconds
+            || unmatchedMaxAttempts < 1 || unmatchedMaxAgeMinutes < 1)
         {
             throw new InvalidOperationException(
-                "Reconciliation__ResendWindowMinutes, PendingExpiryMinutes, MaxAttempts and BackoffSeconds must be at least 1, and BackoffCapSeconds must not be below BackoffSeconds.");
+                "Reconciliation__ResendWindowMinutes, PendingExpiryMinutes, MaxAttempts, BackoffSeconds, UnmatchedMaxAttempts and UnmatchedMaxAgeMinutes must be at least 1, and BackoffCapSeconds must not be below BackoffSeconds.");
         }
 
         return new ReconciliationSettings(
@@ -26,6 +29,8 @@ public static class ReconciliationConfiguration
             TimeSpan.FromMinutes(expiryMinutes),
             maxAttempts,
             TimeSpan.FromSeconds(backoffSeconds),
-            TimeSpan.FromSeconds(backoffCapSeconds));
+            TimeSpan.FromSeconds(backoffCapSeconds),
+            unmatchedMaxAttempts,
+            unmatchedMaxAgeMinutes);
     }
 }

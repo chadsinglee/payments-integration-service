@@ -19,12 +19,13 @@ public sealed class RedisAcmeRateLimiter(RedisRateLimiterOptions options, ILogge
     private const string Key = "acme:rate";
     private const string CooldownKey = "acme:cooldown";
 
-    // Returns 0 when a token was taken, the milliseconds until the oldest token leaves the window when the budget is spent,
-    // or the negated remaining cooldown while a worker's 429 cooldown is active (no token is taken then).
+    // Returns {code, redisNowMs}. code is 0 when a token was taken, the milliseconds until the oldest token leaves the window when the
+    // budget is spent, or the negated remaining cooldown while a worker's 429 cooldown is active (no token is taken then).
+    // redisNowMs is Redis's own clock at the decision, kept for the dispatch diagnostics.
     private const string Script = """
         local cooldown = redis.call('PTTL', KEYS[2])
         if cooldown > 0 then
-            return -cooldown
+            return {-cooldown, 0}
         end
         local t = redis.call('TIME')
         local now = t[1] * 1000 + math.floor(t[2] / 1000)
@@ -32,10 +33,10 @@ public sealed class RedisAcmeRateLimiter(RedisRateLimiterOptions options, ILogge
         if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[1]) then
             redis.call('ZADD', KEYS[1], now, ARGV[2])
             redis.call('PEXPIRE', KEYS[1], 2000)
-            return 0
+            return {0, now}
         end
         local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
-        return math.max(1, tonumber(oldest[2]) + 1000 - now)
+        return {math.max(1, tonumber(oldest[2]) + 1000 - now), now}
         """;
 
     // Only ever lengthens the cooldown, so a short Retry-After cannot cut a longer one short.
@@ -55,13 +56,14 @@ public sealed class RedisAcmeRateLimiter(RedisRateLimiterOptions options, ILogge
         try
         {
             var database = (await ConnectAsync()).GetDatabase();
-            var wait = (long)await database.ScriptEvaluateAsync(
+            var reply = (long[])(await database.ScriptEvaluateAsync(
                 Script,
                 [Key, CooldownKey],
-                [options.LimitPerSecond, Guid.NewGuid().ToString("N")]);
+                [options.LimitPerSecond, Guid.NewGuid().ToString("N")]))!;
+            var wait = reply[0];
             return wait switch
             {
-                0 => new RateLimitResult(RateLimitStatus.Granted),
+                0 => new RateLimitResult(RateLimitStatus.Granted, GrantedAtUnixMs: reply[1]),
                 < 0 => new RateLimitResult(RateLimitStatus.CoolingDown, TimeSpan.FromMilliseconds(-wait)),
                 _ => new RateLimitResult(RateLimitStatus.Wait, TimeSpan.FromMilliseconds(wait)),
             };

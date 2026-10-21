@@ -11,9 +11,13 @@ public sealed record ReconciliationSettings(
     TimeSpan PendingExpiry,
     int MaxAttempts,
     TimeSpan BackoffBase,
-    TimeSpan BackoffCap)
+    TimeSpan BackoffCap,
+    int UnmatchedMaxAttempts = 12,
+    int UnmatchedMaxAgeMinutes = 60)
 {
     public static ReconciliationSettings Default { get; } = new(TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(15), 8, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(5));
+
+    public TimeSpan UnmatchedMaxAge => TimeSpan.FromMinutes(UnmatchedMaxAgeMinutes);
 
     public TimeSpan Backoff(int attempts) =>
         TimeSpan.FromSeconds(Math.Min(BackoffCap.TotalSeconds, BackoffBase.TotalSeconds * Math.Pow(2, Math.Max(0, attempts - 1))));
@@ -33,6 +37,55 @@ public sealed class ReconciliationService(
     ILogger<ReconciliationService> logger)
 {
     private const int SweepBatch = 50;
+
+    /// <summary>
+    /// A reversal/refund webhook that arrived before its payment is retried against order_number. A match is adopted through the
+    /// shared outcome path (currency/amount checks, Recompute); no match counts an attempt, and at the attempt or age limit the
+    /// event is marked exhausted with an ALERT so the sweep never runs forever.
+    /// </summary>
+    public async Task<int> AdoptUnmatchedWebhooksAsync(CancellationToken cancellationToken)
+    {
+        var due = await store.FindDueUnmatchedWebhooksAsync(SweepBatch, settings.BackoffBase, settings.BackoffCap, cancellationToken);
+        var progressed = 0;
+        foreach (var item in due)
+        {
+            var paymentId = string.IsNullOrEmpty(item.Rrn) ? null : await store.FindPaymentIdByOrderNumberAsync(item.Rrn, cancellationToken);
+            if (paymentId is null)
+            {
+                var attempts = item.Attempts + 1;
+                var age = timeProvider.GetUtcNow() - item.ReceivedAt;
+                var exhausted = attempts >= settings.UnmatchedMaxAttempts || age >= settings.UnmatchedMaxAge;
+                await store.RecordUnmatchedAttemptAsync(item.EventId, exhausted, cancellationToken);
+                if (exhausted)
+                {
+                    logger.LogError(
+                        "ALERT unmatched webhook event {EventId} ({EventType}) matched no payment after {Attempts} attempts over {AgeMinutes:F0} min; giving up, needs investigation",
+                        item.EventId, item.Type, attempts, age.TotalMinutes);
+                }
+
+                continue;
+            }
+
+            var type = item.Type;
+            var invalid = type is PaymentEventType.Reversal or PaymentEventType.Refund
+                ? await outcomes.ValidateReversalAsync(paymentId.Value, item.Currency, item.AmountMinor, cancellationToken)
+                : null;
+            if (invalid is not null)
+            {
+                logger.LogError("ALERT late webhook event {EventId} for payment {PaymentId} is inconsistent ({Reason}); stored, not applied", item.EventId, paymentId, invalid);
+                type = PaymentEventType.Informational;
+            }
+
+            var result = await outcomes.AdoptAsync(item.EventId, paymentId.Value, type, invalid is not null, cancellationToken);
+            if (result == ApplyEventResult.Applied)
+            {
+                logger.LogInformation("Adopted late webhook event {EventId} for payment {PaymentId} as {EventType}", item.EventId, paymentId, type);
+                progressed++;
+            }
+        }
+
+        return progressed;
+    }
 
     /// <summary>A Submitted payment whose lease ran out lost its worker: the outcome is unknown, never a resend.</summary>
     public async Task<int> RecoverExpiredLeasesAsync(CancellationToken cancellationToken)
@@ -136,6 +189,7 @@ public sealed class ReconciliationService(
             throw;
         }
 
+        gate.LogDispatch(admission, "RTTQ");
         var result = await acmeClient.QueryTransactionAsync(claimed.TransactionId, CancellationToken.None);
 
         // 401 and 429 say nothing about the payment: give the attempt back instead of counting it toward giving up.
@@ -213,25 +267,28 @@ public sealed class ReconciliationService(
     private async Task HandleNotFoundAsync(ClaimedReconciliation claimed)
     {
         var now = timeProvider.GetUtcNow();
-        var withinWindow = claimed.Status == PaymentStatus.Unknown
+        var canResend = claimed.Status == PaymentStatus.Unknown
             && claimed.FirstSentAt is { } sentAt
-            && now - sentAt <= settings.ResendWindow;
+            && now - sentAt <= settings.ResendWindow
+            && claimed.RttqAttempts < settings.MaxAttempts;
 
-        if (!withinWindow)
+        if (!canResend)
         {
-            // Outside the window a resend is unsafe and a failure unproven: stop and flag for a human. An approved
-            // payment Acme cannot find (amount fetch) just keeps backing off.
+            // Outside the window, or with the attempts used up, a resend is unsafe and a failure unproven: stop and flag
+            // for a human. An approved payment Acme cannot find (amount fetch) just keeps backing off.
             await BackOffAsync(claimed, "NotFound", giveUpIfUnknown: true);
             return;
         }
 
         // Acme never saw it: resubmit the same TransactionID with a new MessageID (the worker claims it as Pending).
+        // The first resend is immediate (the customer is waiting); later ones back off so a gateway that keeps failing is not hammered.
+        var resendAt = claimed.RttqAttempts <= 1 ? now : now + settings.Backoff(claimed.RttqAttempts - 1);
         var resend = SystemEvent(PaymentEventType.Informational, $"rttq-resend:{claimed.PaymentId}:{claimed.RttqAttempts}", "rttq-404-resend");
         await outcomes.ApplyAsync(
             claimed.PaymentId,
             resend,
             (state, update) => state.Status == PaymentStatus.Unknown
-                ? update with { Status = PaymentStatus.Pending, Reconciliation = ReconciliationState.None, NextAttemptAt = now }
+                ? update with { Status = PaymentStatus.Pending, Reconciliation = ReconciliationState.None, NextAttemptAt = resendAt }
                 : update,
             CancellationToken.None);
     }
