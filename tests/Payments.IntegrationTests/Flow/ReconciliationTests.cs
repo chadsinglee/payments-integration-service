@@ -184,6 +184,67 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Recover_WhenTheWorkerIsKilledMidPost_ResolvesThroughRttqWithoutAResend()
+    {
+        await Post("pay-1", 5_000);
+        var transactionId = await TransactionIdAsync("pay-1");
+        var dying = new HoldAfterPostHandler();
+        using var victim = new WorkerHarness(_connectionString, _stub, inner => dying.Wrap(inner));
+
+        // The worker sends the POST (Acme stores the approval) and is then "killed": nothing after the call ever runs.
+        var abandoned = Task.Run(() => victim.Submissions.SubmitNextAsync(TimeSpan.FromSeconds(1), CancellationToken.None));
+        await dying.PostReachedAcme.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        abandoned.IsCompleted.ShouldBeFalse();
+        var killed = await Row("pay-1");
+        killed.Status.ShouldBe("Submitted");
+        (await Scalar<int>("SELECT attempt_count FROM payments")).ShouldBe(1);
+        (await Scalar<bool>("SELECT first_sent_at IS NOT NULL FROM payments")).ShouldBeTrue();
+
+        await Task.Delay(TimeSpan.FromSeconds(1.5));
+        var rttqCalls = new CountingHandler();
+        using var survivor = new WorkerHarness(_connectionString, _stub, inner => rttqCalls.Wrap(inner));
+
+        (await survivor.Reconciliation.RecoverExpiredLeasesAsync(CancellationToken.None)).ShouldBe(1);
+        (await Row("pay-1")).Status.ShouldBe("Unknown");
+        await MakeDue();
+        (await survivor.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Approved");
+        row.AuthAmount.ShouldBe(5_000);
+        rttqCalls.Gets.ShouldBe(1);
+        rttqCalls.Posts.ShouldBe(0);
+        var posts = await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts");
+        posts.GetArrayLength().ShouldBe(1);
+        (await Scalar<Guid>("SELECT transaction_id FROM payments")).ShouldBe(transactionId);
+        abandoned.IsCompleted.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenAcmeReportsMoreThanWasRequested_StopsAtOnceFlaggedAndAlertsOnce()
+    {
+        await Post("pay-1", 7_500);
+        var row = await Row("pay-1");
+        await PostToStubAsync(row.TransactionId, row.OrderNumber, 8_000);
+        (await SendAdviceAsync(Advice(row.TransactionId, "Success", "00"))).StatusCode.ShouldBe(HttpStatusCode.OK);
+        var rttqCalls = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => rttqCalls.Wrap(inner));
+
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var reconciled = await Row("pay-1");
+        reconciled.Status.ShouldBe("Approved");
+        reconciled.AuthAmount.ShouldBeNull();
+        reconciled.NeedsInvestigation.ShouldBeTrue();
+        reconciled.ReconciliationState.ShouldBe("Exhausted");
+        rttqCalls.Gets.ShouldBe(1);
+        await MakeDue();
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        rttqCalls.Gets.ShouldBe(1);
+        harness.Logs.All.Split("ALERT").Length.ShouldBe(2);
+    }
+
+    [Fact]
     public async Task ExpireStalePending_WhenNeverSentWithinTheExpiry_FailsThePayment()
     {
         await Post("pay-1", 5_000);
@@ -417,6 +478,57 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
         public const long FirstPostFails = 99_502;
 
         public const long GatewayError = 99_503;
+    }
+
+    // Forwards the POST to the stub, then never returns: the caller is stuck exactly where a killed process would be.
+    private sealed class HoldAfterPostHandler
+    {
+        public TaskCompletionSource PostReachedAcme { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public HttpMessageHandler Wrap(HttpMessageHandler inner) => new Handler(inner, this);
+
+        private sealed class Handler(HttpMessageHandler inner, HoldAfterPostHandler owner) : DelegatingHandler(inner)
+        {
+            protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                var response = await base.SendAsync(request, cancellationToken);
+                if (request.Method != HttpMethod.Post)
+                {
+                    return response;
+                }
+
+                response.Dispose();
+                owner.PostReachedAcme.SetResult();
+                await new TaskCompletionSource().Task;
+                throw new InvalidOperationException("unreachable");
+            }
+        }
+    }
+
+    private sealed class CountingHandler
+    {
+        public int Gets { get; private set; }
+
+        public int Posts { get; private set; }
+
+        public HttpMessageHandler Wrap(HttpMessageHandler inner) => new Handler(inner, this);
+
+        private sealed class Handler(HttpMessageHandler inner, CountingHandler owner) : DelegatingHandler(inner)
+        {
+            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                if (request.Method == HttpMethod.Post)
+                {
+                    owner.Posts++;
+                }
+                else
+                {
+                    owner.Gets++;
+                }
+
+                return base.SendAsync(request, cancellationToken);
+            }
+        }
     }
 
     private sealed class LoseResponseHandler(HttpMessageHandler inner) : DelegatingHandler(inner)

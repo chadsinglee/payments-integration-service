@@ -179,11 +179,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
         var current = await connection.QuerySingleAsync<StateRow>(new CommandDefinition(
-            "SELECT status AS Status, auth_amount AS AuthAmount, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
+            "SELECT status AS Status, auth_amount AS AuthAmount, amount_minor AS AmountMinor, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
             new { paymentId },
             transaction,
             cancellationToken: cancellationToken));
-        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation);
+        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation, current.AmountMinor);
 
         if (precondition is not null && !precondition(state))
         {
@@ -226,11 +226,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
         var current = await connection.QuerySingleAsync<StateRow>(new CommandDefinition(
-            "SELECT status AS Status, auth_amount AS AuthAmount, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
+            "SELECT status AS Status, auth_amount AS AuthAmount, amount_minor AS AmountMinor, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
             new { paymentId },
             transaction,
             cancellationToken: cancellationToken));
-        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation);
+        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation, current.AmountMinor);
 
         // Under the payment's row lock; a concurrent sweep that already adopted the event leaves nothing to do.
         var adopted = await connection.ExecuteAsync(new CommandDefinition(
@@ -590,6 +590,8 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         public string Status { get; init; } = "";
 
         public long? AuthAmount { get; init; }
+
+        public long AmountMinor { get; init; }
 
         public bool NeedsInvestigation { get; init; }
     }

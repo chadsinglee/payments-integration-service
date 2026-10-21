@@ -314,6 +314,12 @@ public sealed class ReconciliationService(
             return update with { Reconciliation = ReconciliationState.None };
         }
 
+        // Acme's amount was rejected as inconsistent (already alerted): asking again would return the same value.
+        if (update.AuthAmountRejected)
+        {
+            return update with { NeedsInvestigation = true, Reconciliation = ReconciliationState.Exhausted };
+        }
+
         if (claimed.RttqAttempts < settings.MaxAttempts && !(giveUpIfUnknown && update.Status == PaymentStatus.Unknown))
         {
             return update with { Reconciliation = ReconciliationState.InProgress, NextAttemptAt = timeProvider.GetUtcNow() + settings.Backoff(claimed.RttqAttempts) };

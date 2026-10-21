@@ -48,7 +48,7 @@ public sealed record ClaimedPayment(
     public override string ToString() => $"ClaimedPayment {{ PaymentId = {PaymentId}, TransactionId = {TransactionId}, Attempt = {AttemptCount} }}";
 }
 
-public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? AuthAmountMinor, bool NeedsInvestigation = false);
+public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? AuthAmountMinor, bool NeedsInvestigation = false, long? AmountMinor = null);
 
 public sealed record PaymentTerms(string Currency, long AmountMinor, long? AuthAmountMinor);
 
@@ -59,7 +59,8 @@ public sealed record PaymentUpdate(
     long? AuthAmountMinor,
     bool NeedsInvestigation,
     ReconciliationState? Reconciliation = null,
-    DateTimeOffset? NextAttemptAt = null);
+    DateTimeOffset? NextAttemptAt = null,
+    bool AuthAmountRejected = false);
 
 public sealed record ClaimedReconciliation(
     Guid PaymentId,

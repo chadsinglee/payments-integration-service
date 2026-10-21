@@ -73,21 +73,42 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
         store.ApplyEventAsync(
             paymentId,
             paymentEvent,
-            (state, facts) =>
-            {
-                // RTTQ records carry the amount Acme authorised; it fills the gap when no approval callback had it.
-                var authAmount = state.AuthAmountMinor
-                    ?? (paymentEvent.Type is PaymentEventType.Approved or PaymentEventType.ReversalObserved or PaymentEventType.RefundObserved
-                        ? paymentEvent.AuthAmountMinor
-                        : null);
-                var decision = PaymentStatusRules.Recompute(state.Status, authAmount, paymentEvent.Type, facts);
-                if (decision.NeedsInvestigation && !state.NeedsInvestigation)
-                {
-                    logger.LogError("ALERT payment {PaymentId} flagged for investigation after {EventType} (status {Status})", paymentId, paymentEvent.Type, decision.Status);
-                }
-
-                return adjust(state, new PaymentUpdate(decision.Status, authAmount, decision.NeedsInvestigation));
-            },
+            (state, facts) => Decide(state, facts, paymentEvent, adjust, logger),
             precondition,
             cancellationToken);
+
+    /// <summary>
+    /// The status decision under the row lock. An authorised amount above the requested amount cannot be right: it is not stored
+    /// (auth_amount stays unset), the event is kept, and the payment is flagged for investigation.
+    /// </summary>
+    public static PaymentUpdate Decide(
+        PaymentState state,
+        IReadOnlyCollection<PaymentEventFact> facts,
+        NewPaymentEvent paymentEvent,
+        Func<PaymentState, PaymentUpdate, PaymentUpdate> adjust,
+        ILogger logger)
+    {
+        // RTTQ records carry the amount Acme authorised; it fills the gap when no approval callback had it.
+        var authAmount = state.AuthAmountMinor
+            ?? (paymentEvent.Type is PaymentEventType.Approved or PaymentEventType.ReversalObserved or PaymentEventType.RefundObserved
+                ? paymentEvent.AuthAmountMinor
+                : null);
+        var inconsistent = authAmount > state.AmountMinor;
+        if (inconsistent)
+        {
+            logger.LogError(
+                "ALERT payment {PaymentId} authorised amount {AuthAmount} exceeds the requested amount {Amount} ({EventType}); event stored, auth_amount left unset",
+                state.PaymentId, authAmount, state.AmountMinor, paymentEvent.Type);
+            authAmount = null;
+        }
+
+        var decision = PaymentStatusRules.Recompute(state.Status, authAmount, paymentEvent.Type, facts);
+        var needsInvestigation = decision.NeedsInvestigation || inconsistent;
+        if (needsInvestigation && !inconsistent && !state.NeedsInvestigation)
+        {
+            logger.LogError("ALERT payment {PaymentId} flagged for investigation after {EventType} (status {Status})", state.PaymentId, paymentEvent.Type, decision.Status);
+        }
+
+        return adjust(state, new PaymentUpdate(decision.Status, authAmount, needsInvestigation, AuthAmountRejected: inconsistent));
+    }
 }
