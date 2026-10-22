@@ -149,8 +149,17 @@ public sealed class UnmatchedWebhookSweepTests(PostgresFixture postgres) : IAsyn
             Task.Run(() => first.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None)),
             Task.Run(() => second.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None)));
 
+        (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps")).ShouldBe(1);
         (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps WHERE attempts = 1 AND exhausted_at IS NOT NULL")).ShouldBe(1);
         (first.Logs.All + second.Logs.All).Split("ALERT unmatched webhook").Length.ShouldBe(2);
+
+        // Final state is stable: an exhausted event is not swept, counted or alerted again.
+        await MakeDueAsync();
+        await first.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None);
+        await second.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None);
+        (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps WHERE attempts = 1 AND exhausted_at IS NOT NULL")).ShouldBe(1);
+        (first.Logs.All + second.Logs.All).Split("ALERT unmatched webhook").Length.ShouldBe(2);
+        (await CountAsync("SELECT count(*) FROM payment_events WHERE payment_id IS NOT NULL")).ShouldBe(0);
     }
 
     [Fact]

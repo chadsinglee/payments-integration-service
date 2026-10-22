@@ -58,8 +58,12 @@ public sealed class ThroughputProtectionTests(PostgresFixture postgres) : IAsync
         (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
         (await StubPosts()).Count.ShouldBe(1);
 
-        await Task.Delay(TimeSpan.FromSeconds(1.3));
-        (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None))
+        {
+            DateTime.UtcNow.ShouldBeLessThan(deadline, "the paused payment was never released");
+            await Task.Delay(50);
+        }
 
         (await Row("pay-1")).Status.ShouldBe("Approved");
         var posts = await StubPosts();

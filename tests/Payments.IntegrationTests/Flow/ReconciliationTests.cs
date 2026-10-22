@@ -105,7 +105,7 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
 
         await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
         (await Row("pay-1")).Status.ShouldBe("Pending");
-        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await SubmitWhenClaimableAsync(harness);
 
         (await Row("pay-1")).Status.ShouldBe("Approved");
         var posts = await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts");
@@ -141,7 +141,7 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
         await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
         await MakeDue();
         await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
-        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await SubmitWhenClaimableAsync(harness);
         await MakeDue();
 
         await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
@@ -479,6 +479,17 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     {
         await using var connection = new NpgsqlConnection(_connectionString);
         await connection.ExecuteAsync(sql);
+    }
+
+    // The immediate resend is stamped with the app clock and claimed against the database clock, which can differ by about a millisecond.
+    private static async Task SubmitWhenClaimableAsync(WorkerHarness harness)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None))
+        {
+            DateTime.UtcNow.ShouldBeLessThan(deadline, "the resend was never claimable");
+            await Task.Delay(20);
+        }
     }
 
     private async Task<T> Scalar<T>(string sql)
