@@ -110,7 +110,13 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
             logger.LogError("ALERT payment {PaymentId} flagged for investigation after {EventType} (status {Status})", state.PaymentId, paymentEvent.Type, decision.Status);
         }
 
-        var update = adjust(state, new PaymentUpdate(decision.Status, authAmount, needsInvestigation, AuthAmountRejected: inconsistent));
+        // Exhausted at once, on every path: asking RTTQ again would return the same inconsistent value.
+        var update = adjust(state, new PaymentUpdate(
+            decision.Status,
+            authAmount,
+            needsInvestigation,
+            AuthAmountRejected: inconsistent,
+            Reconciliation: inconsistent ? ReconciliationState.Exhausted : null));
         LogTransition(logger, state, update.Status, ReasonFor(paymentEvent), paymentEvent.Type, paymentEvent.Source);
         return update;
     }

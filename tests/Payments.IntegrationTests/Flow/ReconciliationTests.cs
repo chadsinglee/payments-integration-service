@@ -245,6 +245,27 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Submit_WhenThePostResponseAuthorisesMoreThanWasRequested_IsExhaustedAtOnceWithoutRttqAndAlertsOnce()
+    {
+        await Post("pay-1", 7_500);
+        var calls = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new OverstateAuthAmountHandler(calls.Wrap(inner), 8_000));
+
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Approved");
+        row.AuthAmount.ShouldBeNull();
+        row.NeedsInvestigation.ShouldBeTrue();
+        row.ReconciliationState.ShouldBe("Exhausted");
+        await MakeDue();
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        calls.Gets.ShouldBe(0);
+        calls.Posts.ShouldBe(1);
+        harness.Logs.All.Split("ALERT").Length.ShouldBe(2);
+    }
+
+    [Fact]
     public async Task Reconcile_WhenRttqReturns5xx_BacksOffAndDoesNotResend()
     {
         await Post("pay-1", 5_000);
@@ -551,6 +572,23 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
 
                 return base.SendAsync(request, cancellationToken);
             }
+        }
+    }
+
+    private sealed class OverstateAuthAmountHandler(HttpMessageHandler inner, long authAmount) : DelegatingHandler(inner)
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = await base.SendAsync(request, cancellationToken);
+            if (request.Method != HttpMethod.Post)
+            {
+                return response;
+            }
+
+            var body = System.Text.Json.Nodes.JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken))!;
+            body["PaymentResponse"]!["AuthAmount"] = authAmount;
+            response.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+            return response;
         }
     }
 
