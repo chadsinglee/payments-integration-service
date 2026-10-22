@@ -11,7 +11,6 @@ public sealed class PaymentSubmissionService(
     IAcmeClient acmeClient,
     AcmeGate gate,
     PaymentOutcomeService outcomes,
-    TimeProvider timeProvider,
     ILogger<PaymentSubmissionService> logger)
 {
     /// <summary>Claims and submits one due payment. Returns false when nothing was submitted (nothing due, or Acme calls are paused).</summary>
@@ -30,7 +29,10 @@ public sealed class PaymentSubmissionService(
         }
 
         // Every log line for this payment (ours and the HTTP client's) carries these ids.
-        using var scope = logger.BeginScope("PaymentId={PaymentId} TransactionId={TransactionId}", claimed.PaymentId, claimed.TransactionId);
+        using var scope = logger.BeginScope(
+            "PaymentId={PaymentId} TransactionId={TransactionId} OrderNumber={OrderNumber} AttemptCount={AttemptCount}",
+            claimed.PaymentId, claimed.TransactionId, claimed.OrderNumber, claimed.AttemptCount);
+        logger.LogDebug("Claim won for payment {PaymentId}", claimed.PaymentId);
 
         GateAdmission admission;
         try
@@ -39,13 +41,14 @@ public sealed class PaymentSubmissionService(
         }
         catch (Exception)
         {
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
         if (!admission.Granted)
         {
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow() + admission.RetryAfter, CancellationToken.None);
+            logger.LogInformation("Acme limiter denied payment {PaymentId}; claim released, retry in {RetryAfter}", claimed.PaymentId, admission.RetryAfter);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, admission.RetryAfter, CancellationToken.None);
             return false;
         }
 
@@ -62,7 +65,7 @@ public sealed class PaymentSubmissionService(
             if (!await store.ExtendClaimAsync(claimed.PaymentId, claimed.AttemptCount, lease, CancellationToken.None))
             {
                 gate.AbandonProbe(admission);
-                logger.LogWarning("Payment {PaymentId} was not sent: attempt {Attempt} no longer owns its claim (lease expired or taken over)", claimed.PaymentId, claimed.AttemptCount);
+                logger.LogWarning("Payment {PaymentId} was not sent: attempt {AttemptCount} no longer owns its claim (lease extension failed: expired or taken over)", claimed.PaymentId, claimed.AttemptCount);
                 return false;
             }
 
@@ -71,10 +74,12 @@ public sealed class PaymentSubmissionService(
         catch (Exception)
         {
             gate.AbandonProbe(admission);
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
+        using var callScope = logger.BeginScope("MessageId={MessageId}", request.MessageId);
+        gate.LogDispatch(admission, "POST");
         var result = await acmeClient.SubmitPaymentAsync(request, CancellationToken.None);
 
         // 401 and 429 mean Acme processed nothing, so the payment goes back to Pending (same TransactionID, a new MessageID next time).
@@ -96,7 +101,7 @@ public sealed class PaymentSubmissionService(
         if (signal.Kind != AcmeSignalKind.None)
         {
             await gate.ShareCooldownAsync(signal);
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow() + signal.Delay, CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, signal.Delay, CancellationToken.None);
             logger.LogWarning(
                 "Payment {PaymentId} released to Pending after {Signal}; next attempt in {Delay}",
                 claimed.PaymentId,
@@ -111,7 +116,7 @@ public sealed class PaymentSubmissionService(
 
         LogAlert(claimed, outcome.Alert);
         logger.LogInformation(
-            "Payment {PaymentId} submitted as {TransactionId} (attempt {Attempt}): {EventType}, HTTP {HttpStatus}",
+            "Payment {PaymentId} submitted as {TransactionId} (attempt {AttemptCount}): {EventType}, HTTP {HttpStatus}",
             claimed.PaymentId,
             claimed.TransactionId,
             claimed.AttemptCount,

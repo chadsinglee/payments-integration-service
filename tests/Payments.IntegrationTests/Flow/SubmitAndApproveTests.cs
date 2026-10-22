@@ -61,6 +61,16 @@ public sealed class SubmitAndApproveTests(PostgresFixture postgres) : IAsyncLife
     }
 
     [Fact]
+    public async Task SubmitPayment_WhenAccepted_PointsLocationAtTheNewPayment()
+    {
+        var response = await Post(new { paymentId = "pay-loc", customerId = "cust-001", subMerchantId = "ZAP0004182", amount = 1_000 });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Accepted);
+        response.Headers.Location.ShouldNotBeNull().OriginalString.ShouldBe("/payments/pay-loc");
+        (await Get("pay-loc")).GetProperty("status").GetString().ShouldBe("Pending");
+    }
+
+    [Fact]
     public async Task SubmitNext_WhenGatewayReturns503_EndsUnknownAfterExactlyOnePost()
     {
         await Post(new { paymentId = "pay-503", customerId = "cust-001", subMerchantId = "ZAP0004182", amount = 99_503 });
@@ -100,7 +110,8 @@ public sealed class SubmitAndApproveTests(PostgresFixture postgres) : IAsyncLife
         await using var connection = new NpgsqlConnection(_connectionString);
         var ids = await connection.QuerySingleAsync<(Guid Id, Guid TransactionId)>("SELECT id, transaction_id FROM payments WHERE app_payment_id = 'pay-scope'");
         var outcome = harness.Logs.AllWithScopes.Split('\n').Single(line => line.Contains("submitted as"));
-        outcome.ShouldStartWith($"[PaymentId={ids.Id} TransactionId={ids.TransactionId}]");
+        outcome.ShouldStartWith($"[PaymentId={ids.Id} TransactionId={ids.TransactionId} OrderNumber=");
+        outcome.ShouldContain("AttemptCount=1");
     }
 
     [Fact]

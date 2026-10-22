@@ -105,13 +105,28 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
 
         await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
         (await Row("pay-1")).Status.ShouldBe("Pending");
-        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await SubmitWhenClaimableAsync(harness);
 
         (await Row("pay-1")).Status.ShouldBe("Approved");
         var posts = await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts");
         posts.GetArrayLength().ShouldBe(2);
         posts[1].GetProperty("transactionId").GetString().ShouldBe(posts[0].GetProperty("transactionId").GetString());
         posts[1].GetProperty("messageId").GetString().ShouldNotBe(posts[0].GetProperty("messageId").GetString());
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenTheAppClockIsAheadOfTheDatabase_TheImmediateResendIsStillClaimableAtOnce()
+    {
+        await Post("pay-1", StubAmounts.FirstPostFails);
+        using var harness = new WorkerHarness(_connectionString, _stub, clock: new OffsetTimeProvider(TimeSpan.FromSeconds(30)));
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await MakeDue();
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        (await Row("pay-1")).Status.ShouldBe("Pending");
+        (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+        (await Row("pay-1")).Status.ShouldBe("Approved");
     }
 
     [Fact]
@@ -134,6 +149,42 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Reconcile_WhenTheResendIsNotSeenEither_DelaysTheNextResendInsteadOfLooping()
+    {
+        await Post("pay-1", StubAmounts.GatewayError);
+        using var harness = new WorkerHarness(_connectionString, _stub);
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await MakeDue();
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+        await SubmitWhenClaimableAsync(harness);
+        await MakeDue();
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        (await Row("pay-1")).Status.ShouldBe("Pending");
+        (await Scalar<bool>("SELECT next_attempt_at > now() + interval '5 seconds' FROM payments")).ShouldBeTrue();
+        (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenTheMaxAttemptsAreUsedInsideTheWindow_StopsFlaggedAndStaysUnknown()
+    {
+        await Post("pay-1", StubAmounts.GatewayError);
+        using var harness = new WorkerHarness(_connectionString, _stub);
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await Execute($"UPDATE payments SET rttq_attempts = {ReconciliationSettings.Default.MaxAttempts - 1}, next_attempt_at = now() - interval '1 second'");
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Unknown");
+        row.NeedsInvestigation.ShouldBeTrue();
+        row.ReconciliationState.ShouldBe("Exhausted");
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(1);
+    }
+
+    [Fact]
     public async Task RecoverExpiredLeases_WhenAWorkerDiedMidSubmit_MarksTheOutcomeUnknownOnce()
     {
         await Post("pay-1", 5_000);
@@ -145,6 +196,111 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
 
         (await Row("pay-1")).Status.ShouldBe("Unknown");
         (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task Recover_WhenTheWorkerIsKilledMidPost_ResolvesThroughRttqWithoutAResend()
+    {
+        await Post("pay-1", 5_000);
+        var transactionId = await TransactionIdAsync("pay-1");
+        var dying = new HoldAfterPostHandler();
+        using var victim = new WorkerHarness(_connectionString, _stub, inner => dying.Wrap(inner));
+
+        // The worker sends the POST (Acme stores the approval) and is then "killed": nothing after the call ever runs.
+        var abandoned = Task.Run(() => victim.Submissions.SubmitNextAsync(TimeSpan.FromSeconds(1), CancellationToken.None));
+        await dying.PostReachedAcme.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        abandoned.IsCompleted.ShouldBeFalse();
+        var killed = await Row("pay-1");
+        killed.Status.ShouldBe("Submitted");
+        (await Scalar<int>("SELECT attempt_count FROM payments")).ShouldBe(1);
+        (await Scalar<bool>("SELECT first_sent_at IS NOT NULL FROM payments")).ShouldBeTrue();
+
+        await Task.Delay(TimeSpan.FromSeconds(1.5));
+        var rttqCalls = new CountingHandler();
+        using var survivor = new WorkerHarness(_connectionString, _stub, inner => rttqCalls.Wrap(inner));
+
+        (await survivor.Reconciliation.RecoverExpiredLeasesAsync(CancellationToken.None)).ShouldBe(1);
+        (await Row("pay-1")).Status.ShouldBe("Unknown");
+        await MakeDue();
+        (await survivor.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Approved");
+        row.AuthAmount.ShouldBe(5_000);
+        rttqCalls.Gets.ShouldBe(1);
+        rttqCalls.Posts.ShouldBe(0);
+        var posts = await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts");
+        posts.GetArrayLength().ShouldBe(1);
+        (await Scalar<Guid>("SELECT transaction_id FROM payments")).ShouldBe(transactionId);
+        abandoned.IsCompleted.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenAcmeReportsMoreThanWasRequested_StopsAtOnceFlaggedAndAlertsOnce()
+    {
+        await Post("pay-1", 7_500);
+        var row = await Row("pay-1");
+        await PostToStubAsync(row.TransactionId, row.OrderNumber, 8_000);
+        (await SendAdviceAsync(Advice(row.TransactionId, "Success", "00"))).StatusCode.ShouldBe(HttpStatusCode.OK);
+        var rttqCalls = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => rttqCalls.Wrap(inner));
+
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var reconciled = await Row("pay-1");
+        reconciled.Status.ShouldBe("Approved");
+        reconciled.AuthAmount.ShouldBeNull();
+        reconciled.NeedsInvestigation.ShouldBeTrue();
+        reconciled.ReconciliationState.ShouldBe("Exhausted");
+        rttqCalls.Gets.ShouldBe(1);
+        await MakeDue();
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        rttqCalls.Gets.ShouldBe(1);
+        harness.Logs.All.Split("ALERT").Length.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Submit_WhenThePostResponseAuthorisesMoreThanWasRequested_IsExhaustedAtOnceWithoutRttqAndAlertsOnce()
+    {
+        await Post("pay-1", 7_500);
+        var calls = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new OverstateAuthAmountHandler(calls.Wrap(inner), 8_000));
+
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Approved");
+        row.AuthAmount.ShouldBeNull();
+        row.NeedsInvestigation.ShouldBeTrue();
+        row.ReconciliationState.ShouldBe("Exhausted");
+        await MakeDue();
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeFalse();
+        calls.Gets.ShouldBe(0);
+        calls.Posts.ShouldBe(1);
+        harness.Logs.All.Split("ALERT").Length.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Reconcile_WhenRttqReturns5xx_BacksOffAndDoesNotResend()
+    {
+        await Post("pay-1", 5_000);
+        var rttq = new CountingHandler();
+        using var harness = new WorkerHarness(_connectionString, _stub, inner => new FailQueriesHandler(rttq.Wrap(new LoseResponseHandler(inner))));
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        var transactionId = await TransactionIdAsync("pay-1");
+        await MakeDue();
+
+        (await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+
+        var row = await Row("pay-1");
+        row.Status.ShouldBe("Unknown");
+        row.RttqAttempts.ShouldBe(1);
+        row.ReconciliationState.ShouldBe("InProgress");
+        row.NeedsInvestigation.ShouldBeFalse();
+        (await Scalar<bool>("SELECT next_attempt_at > now() FROM payments")).ShouldBeTrue();
+        (await Scalar<Guid>("SELECT transaction_id FROM payments")).ShouldBe(transactionId);
+        (await _stubClient.GetFromJsonAsync<JsonElement>("/admin/posts")).GetArrayLength().ShouldBe(1);
+        rttq.Posts.ShouldBe(1);
     }
 
     [Fact]
@@ -340,6 +496,21 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
         await connection.ExecuteAsync(sql);
     }
 
+    private sealed class OffsetTimeProvider(TimeSpan offset) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + offset;
+    }
+
+    private static async Task SubmitWhenClaimableAsync(WorkerHarness harness)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None))
+        {
+            DateTime.UtcNow.ShouldBeLessThan(deadline, "the resend was never claimable");
+            await Task.Delay(20);
+        }
+    }
+
     private async Task<T> Scalar<T>(string sql)
     {
         await using var connection = new NpgsqlConnection(_connectionString);
@@ -379,6 +550,84 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     private static class StubAmounts
     {
         public const long FirstPostFails = 99_502;
+
+        public const long GatewayError = 99_503;
+    }
+
+    // Forwards the POST to the stub, then never returns: the caller is stuck exactly where a killed process would be.
+    private sealed class HoldAfterPostHandler
+    {
+        public TaskCompletionSource PostReachedAcme { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public HttpMessageHandler Wrap(HttpMessageHandler inner) => new Handler(inner, this);
+
+        private sealed class Handler(HttpMessageHandler inner, HoldAfterPostHandler owner) : DelegatingHandler(inner)
+        {
+            protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                var response = await base.SendAsync(request, cancellationToken);
+                if (request.Method != HttpMethod.Post)
+                {
+                    return response;
+                }
+
+                response.Dispose();
+                owner.PostReachedAcme.SetResult();
+                await new TaskCompletionSource().Task;
+                throw new InvalidOperationException("unreachable");
+            }
+        }
+    }
+
+    private sealed class CountingHandler
+    {
+        public int Gets { get; private set; }
+
+        public int Posts { get; private set; }
+
+        public HttpMessageHandler Wrap(HttpMessageHandler inner) => new Handler(inner, this);
+
+        private sealed class Handler(HttpMessageHandler inner, CountingHandler owner) : DelegatingHandler(inner)
+        {
+            protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            {
+                if (request.Method == HttpMethod.Post)
+                {
+                    owner.Posts++;
+                }
+                else
+                {
+                    owner.Gets++;
+                }
+
+                return base.SendAsync(request, cancellationToken);
+            }
+        }
+    }
+
+    private sealed class OverstateAuthAmountHandler(HttpMessageHandler inner, long authAmount) : DelegatingHandler(inner)
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = await base.SendAsync(request, cancellationToken);
+            if (request.Method != HttpMethod.Post)
+            {
+                return response;
+            }
+
+            var body = System.Text.Json.Nodes.JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken))!;
+            body["PaymentResponse"]!["AuthAmount"] = authAmount;
+            response.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+            return response;
+        }
+    }
+
+    private sealed class FailQueriesHandler(HttpMessageHandler inner) : DelegatingHandler(inner)
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            request.Method == HttpMethod.Get
+                ? Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{}") })
+                : base.SendAsync(request, cancellationToken);
     }
 
     private sealed class LoseResponseHandler(HttpMessageHandler inner) : DelegatingHandler(inner)

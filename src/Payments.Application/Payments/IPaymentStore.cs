@@ -21,7 +21,7 @@ public interface IPaymentStore
     /// Puts a claimed payment back to Pending without having called Acme (or after Acme rejected the call without processing it:
     /// 401, 429). The attempt is not counted. Does nothing when the payment has moved on (a callback resolved it).
     /// </summary>
-    Task ReleaseClaimAsync(Guid paymentId, int attemptCount, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken);
+    Task ReleaseClaimAsync(Guid paymentId, int attemptCount, TimeSpan delay, CancellationToken cancellationToken);
 
     /// <summary>
     /// Ownership check and lease renewal in one statement, run immediately before the POST. True only when this worker still owns
@@ -33,8 +33,8 @@ public interface IPaymentStore
     /// <summary>The same check for an RTTQ claim (still InProgress on this attempt and not yet due for another worker).</summary>
     Task<bool> ExtendReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan lease, CancellationToken cancellationToken);
 
-    /// <summary>The same for an RTTQ claim: the attempt is given back and the payment is due again at <paramref name="nextAttemptAt"/>.</summary>
-    Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken);
+    /// <summary>The same for an RTTQ claim: the attempt is given back and the payment is due again after <paramref name="delay"/> (computed on the database clock).</summary>
+    Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan delay, CancellationToken cancellationToken);
 
     /// <summary>
     /// Locks the payment row, appends the event, recomputes status with <paramref name="decide"/> and commits in one
@@ -52,9 +52,34 @@ public interface IPaymentStore
     /// <summary>Stores a callback that matches no payment (payment_id null) so it is never lost.</summary>
     Task<ApplyEventResult> RecordUnmatchedEventAsync(NewPaymentEvent paymentEvent, CancellationToken cancellationToken);
 
+    /// <summary>Unmatched webhook events whose next retry is due and that are not yet exhausted.</summary>
+    Task<IReadOnlyList<UnmatchedWebhook>> FindDueUnmatchedWebhooksAsync(int limit, TimeSpan backoffBase, TimeSpan backoffCap, CancellationToken cancellationToken);
+
+    /// <summary>Counts one failed match attempt; <paramref name="exhausted"/> stops further attempts.</summary>
+    Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs one unmatched-event sweep pass only if no other worker is running one: a transaction-level advisory lock is tried
+    /// without waiting and held until the pass ends. Returns null (pass not run) when another worker holds it.
+    /// </summary>
+    Task<int?> TryRunUnmatchedSweepAsync(Func<CancellationToken, Task<int>> pass, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Attaches a stored unmatched event to its payment and recomputes the status, in one transaction under the payment's row lock
+    /// (the same recompute as <see cref="ApplyEventAsync"/>). Skipped when the event was already adopted.
+    /// </summary>
+    Task<ApplyEventResult> AdoptUnmatchedEventAsync(
+        long eventId,
+        Guid paymentId,
+        PaymentEventType type,
+        Func<PaymentState, IReadOnlyCollection<PaymentEventFact>, PaymentUpdate> decide,
+        CancellationToken cancellationToken);
+
     Task<Guid?> FindPaymentIdByTransactionIdAsync(Guid transactionId, CancellationToken cancellationToken);
 
     Task<Guid?> FindPaymentIdByOrderNumberAsync(string orderNumber, CancellationToken cancellationToken);
+
+    Task<string?> GetOrderNumberAsync(Guid paymentId, CancellationToken cancellationToken);
 
     /// <summary>Currency and amounts a later reversal or refund must stay within; both are fixed once the payment exists.</summary>
     Task<PaymentTerms?> GetTermsAsync(Guid paymentId, CancellationToken cancellationToken);

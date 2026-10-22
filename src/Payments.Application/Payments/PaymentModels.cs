@@ -48,16 +48,19 @@ public sealed record ClaimedPayment(
     public override string ToString() => $"ClaimedPayment {{ PaymentId = {PaymentId}, TransactionId = {TransactionId}, Attempt = {AttemptCount} }}";
 }
 
-public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? AuthAmountMinor, bool NeedsInvestigation = false);
+public sealed record PaymentState(Guid PaymentId, PaymentStatus Status, long? AuthAmountMinor, bool NeedsInvestigation = false, long? AmountMinor = null);
 
 public sealed record PaymentTerms(string Currency, long AmountMinor, long? AuthAmountMinor);
+
+public sealed record UnmatchedWebhook(long EventId, string? Rrn, PaymentEventType Type, long? AmountMinor, string? Currency, int Attempts, DateTimeOffset ReceivedAt);
 
 public sealed record PaymentUpdate(
     PaymentStatus Status,
     long? AuthAmountMinor,
     bool NeedsInvestigation,
     ReconciliationState? Reconciliation = null,
-    DateTimeOffset? NextAttemptAt = null);
+    TimeSpan? NextAttemptIn = null,
+    bool AuthAmountRejected = false);
 
 public sealed record ClaimedReconciliation(
     Guid PaymentId,
@@ -65,9 +68,10 @@ public sealed record ClaimedReconciliation(
     PaymentStatus Status,
     long? AuthAmountMinor,
     DateTimeOffset? FirstSentAt,
-    int RttqAttempts);
+    int RttqAttempts,
+    string? OrderNumber = null);
 
-public sealed record StuckPayment(Guid PaymentId, int AttemptCount);
+public sealed record StuckPayment(Guid PaymentId, int AttemptCount, Guid TransactionId, string OrderNumber);
 
 public enum ApplyEventResult
 {

@@ -272,6 +272,19 @@ public sealed class CallbackTests(PostgresFixture postgres) : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Webhook_WhenBodyHasUnknownFields_IsAcceptedAndApplied()
+    {
+        var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);
+        var body = Webhook("u-1", "Reversal", rrn, 10_000);
+        body = body[..^1] + ",\"somethingNew\":{\"nested\":[1,2]},\"flag\":true}";
+
+        var response = await SendSignedWebhookAsync(body);
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        (await StatusAsync("pay-1")).ShouldBe("Reversed");
+    }
+
+    [Fact]
     public async Task Webhook_WhenReversalFollowsApproval_ReversesThePayment()
     {
         var (_, _, rrn) = await CreateApprovedAsync("pay-1", 10_000);

@@ -103,7 +103,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 new SubMerchant(row.SubMerchantId, row.TradingName, row.City, row.Region, row.Country, row.Mcc));
     }
 
-    public async Task ReleaseClaimAsync(Guid paymentId, int attemptCount, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken)
+    public async Task ReleaseClaimAsync(Guid paymentId, int attemptCount, TimeSpan delay, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await connection.ExecuteAsync(new CommandDefinition(
@@ -114,11 +114,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 first_sent_at = CASE WHEN attempt_count = 1 THEN NULL ELSE first_sent_at END,
                 lease_until = NULL,
                 deferred_at = now(),
-                next_attempt_at = @nextAttemptAt,
+                next_attempt_at = now() + make_interval(secs => @delaySeconds),
                 updated_at = now()
             WHERE id = @paymentId AND status = 'Submitted' AND attempt_count = @attemptCount
             """,
-            new { paymentId, attemptCount, nextAttemptAt = nextAttemptAt.ToUniversalTime() },
+            new { paymentId, attemptCount, delaySeconds = delay.TotalSeconds },
             cancellationToken: cancellationToken));
     }
 
@@ -152,7 +152,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         return extended == 1;
     }
 
-    public async Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken)
+    public async Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan delay, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await connection.ExecuteAsync(new CommandDefinition(
@@ -160,11 +160,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             UPDATE payments
             SET rttq_attempts = rttq_attempts - 1,
                 reconciliation_state = CASE WHEN rttq_attempts = 1 THEN 'None' ELSE reconciliation_state END,
-                next_attempt_at = @nextAttemptAt,
+                next_attempt_at = now() + make_interval(secs => @delaySeconds),
                 updated_at = now()
             WHERE id = @paymentId AND reconciliation_state = 'InProgress' AND rttq_attempts = @rttqAttempts
             """,
-            new { paymentId, rttqAttempts, nextAttemptAt = nextAttemptAt.ToUniversalTime() },
+            new { paymentId, rttqAttempts, delaySeconds = delay.TotalSeconds },
             cancellationToken: cancellationToken));
     }
 
@@ -179,11 +179,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
         var current = await connection.QuerySingleAsync<StateRow>(new CommandDefinition(
-            "SELECT status AS Status, auth_amount AS AuthAmount, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
+            "SELECT status AS Status, auth_amount AS AuthAmount, amount_minor AS AmountMinor, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
             new { paymentId },
             transaction,
             cancellationToken: cancellationToken));
-        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation);
+        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation, current.AmountMinor);
 
         if (precondition is not null && !precondition(state))
         {
@@ -206,7 +206,114 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             return outcome;
         }
 
-        var facts = (await connection.QueryAsync<FactRow>(new CommandDefinition(
+        var facts = await LoadFactsAsync(connection, transaction, paymentId, cancellationToken);
+
+        var update = decide(state, facts);
+        await WriteUpdateAsync(connection, transaction, paymentId, update, cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+        return ApplyEventResult.Applied;
+    }
+
+    public async Task<ApplyEventResult> AdoptUnmatchedEventAsync(
+        long eventId,
+        Guid paymentId,
+        PaymentEventType type,
+        Func<PaymentState, IReadOnlyCollection<PaymentEventFact>, PaymentUpdate> decide,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+
+        var current = await connection.QuerySingleAsync<StateRow>(new CommandDefinition(
+            "SELECT status AS Status, auth_amount AS AuthAmount, amount_minor AS AmountMinor, needs_investigation AS NeedsInvestigation FROM payments WHERE id = @paymentId FOR UPDATE",
+            new { paymentId },
+            transaction,
+            cancellationToken: cancellationToken));
+        var state = new PaymentState(paymentId, Enum.Parse<PaymentStatus>(current.Status), current.AuthAmount, current.NeedsInvestigation, current.AmountMinor);
+
+        // Under the payment's row lock; a concurrent sweep that already adopted the event leaves nothing to do.
+        var adopted = await connection.ExecuteAsync(new CommandDefinition(
+            "UPDATE payment_events SET payment_id = @paymentId, event_type = @eventType WHERE id = @eventId AND payment_id IS NULL",
+            new { paymentId, eventId, eventType = (short)type },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (adopted == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return ApplyEventResult.Skipped;
+        }
+
+        var facts = await LoadFactsAsync(connection, transaction, paymentId, cancellationToken);
+        await WriteUpdateAsync(connection, transaction, paymentId, decide(state, facts), cancellationToken);
+
+        await transaction.CommitAsync(cancellationToken);
+        return ApplyEventResult.Applied;
+    }
+
+    public async Task<IReadOnlyList<UnmatchedWebhook>> FindDueUnmatchedWebhooksAsync(int limit, TimeSpan backoffBase, TimeSpan backoffCap, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        var rows = await connection.QueryAsync<UnmatchedRow>(new CommandDefinition(
+            """
+            SELECT e.id AS EventId, e.payload->>'rrn' AS Rrn, e.event_type AS TypeValue, e.amount_minor AS AmountMinor,
+                   e.payload->>'currencyCode' AS Currency, COALESCE(s.attempts, 0) AS Attempts, e.received_at AS ReceivedAt
+            FROM payment_events e
+            LEFT JOIN unmatched_event_sweeps s ON s.event_id = e.id
+            WHERE e.payment_id IS NULL AND e.source = 3 AND s.exhausted_at IS NULL
+              AND (s.last_attempt_at IS NULL
+                   OR s.last_attempt_at + make_interval(secs => LEAST(@capSeconds, @baseSeconds * power(2, GREATEST(s.attempts - 1, 0)))) <= now())
+            ORDER BY e.id
+            LIMIT @limit
+            """,
+            new { limit, baseSeconds = backoffBase.TotalSeconds, capSeconds = backoffCap.TotalSeconds },
+            cancellationToken: cancellationToken));
+        return rows
+            .Select(row => new UnmatchedWebhook(row.EventId, row.Rrn, (PaymentEventType)row.TypeValue, row.AmountMinor, row.Currency, row.Attempts, row.ReceivedAt))
+            .ToList();
+    }
+
+    /// <summary>Advisory-lock key for the unmatched-event sweep (one pass at a time across all workers).</summary>
+    public const long UnmatchedSweepLockKey = 7_301_002_001;
+
+    public async Task<int?> TryRunUnmatchedSweepAsync(Func<CancellationToken, Task<int>> pass, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+        var acquired = await connection.ExecuteScalarAsync<bool>(new CommandDefinition(
+            "SELECT pg_try_advisory_xact_lock(@key)",
+            new { key = UnmatchedSweepLockKey },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (!acquired)
+        {
+            return null;
+        }
+
+        // The pass does its own database work on other connections; this transaction only owns the lock until it ends.
+        var result = await pass(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return result;
+    }
+
+    public async Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO unmatched_event_sweeps (event_id, attempts, last_attempt_at, exhausted_at)
+            VALUES (@eventId, 1, now(), CASE WHEN @exhausted THEN now() END)
+            ON CONFLICT (event_id) DO UPDATE
+            SET attempts = unmatched_event_sweeps.attempts + 1,
+                last_attempt_at = now(),
+                exhausted_at = CASE WHEN @exhausted THEN now() ELSE unmatched_event_sweeps.exhausted_at END
+            """,
+            new { eventId, exhausted },
+            cancellationToken: cancellationToken));
+    }
+
+    private static async Task<List<PaymentEventFact>> LoadFactsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid paymentId, CancellationToken cancellationToken) =>
+        (await connection.QueryAsync<FactRow>(new CommandDefinition(
             "SELECT id AS Id, event_type AS EventType, amount_minor AS AmountMinor, occurred_at AS OccurredAt FROM payment_events WHERE payment_id = @paymentId",
             new { paymentId },
             transaction,
@@ -214,16 +321,15 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             .Select(row => new PaymentEventFact(row.Id, (PaymentEventType)row.EventType, row.AmountMinor, row.OccurredAt))
             .ToList();
 
-        var update = decide(state, facts);
-
-        await connection.ExecuteAsync(new CommandDefinition(
+    private static Task WriteUpdateAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid paymentId, PaymentUpdate update, CancellationToken cancellationToken) =>
+        connection.ExecuteAsync(new CommandDefinition(
             """
             UPDATE payments
             SET status = @status,
                 auth_amount = COALESCE(auth_amount, @authAmount),
                 needs_investigation = needs_investigation OR @needsInvestigation,
                 reconciliation_state = COALESCE(@reconciliation, CASE WHEN status <> @status THEN 'None' ELSE reconciliation_state END),
-                next_attempt_at = COALESCE(@nextAttemptAt, next_attempt_at),
+                next_attempt_at = COALESCE(now() + make_interval(secs => @nextAttemptDelaySeconds), next_attempt_at),
                 lease_until = CASE WHEN @status = 'Submitted' THEN lease_until ELSE NULL END,
                 updated_at = now()
             WHERE id = @paymentId
@@ -235,14 +341,10 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 authAmount = update.AuthAmountMinor,
                 needsInvestigation = update.NeedsInvestigation,
                 reconciliation = update.Reconciliation?.ToString(),
-                nextAttemptAt = update.NextAttemptAt?.ToUniversalTime(),
+                nextAttemptDelaySeconds = update.NextAttemptIn?.TotalSeconds,
             },
             transaction,
             cancellationToken: cancellationToken));
-
-        await transaction.CommitAsync(cancellationToken);
-        return ApplyEventResult.Applied;
-    }
 
     public async Task<ApplyEventResult> RecordUnmatchedEventAsync(NewPaymentEvent paymentEvent, CancellationToken cancellationToken)
     {
@@ -268,6 +370,15 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         return await connection.QuerySingleOrDefaultAsync<Guid?>(new CommandDefinition(
             "SELECT id FROM payments WHERE order_number = @orderNumber",
             new { orderNumber },
+            cancellationToken: cancellationToken));
+    }
+
+    public async Task<string?> GetOrderNumberAsync(Guid paymentId, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        return await connection.QuerySingleOrDefaultAsync<string?>(new CommandDefinition(
+            "SELECT order_number FROM payments WHERE id = @paymentId",
+            new { paymentId },
             cancellationToken: cancellationToken));
     }
 
@@ -370,21 +481,21 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             FROM next
             WHERE p.id = next.id
             RETURNING p.id AS PaymentId, p.transaction_id AS TransactionId, p.status AS Status, p.auth_amount AS AuthAmount,
-                      p.first_sent_at AS FirstSentAt, p.rttq_attempts AS RttqAttempts
+                      p.first_sent_at AS FirstSentAt, p.rttq_attempts AS RttqAttempts, p.order_number AS OrderNumber
             """,
             new { leaseSeconds = lease.TotalSeconds },
             cancellationToken: cancellationToken));
 
         return row is null
             ? null
-            : new ClaimedReconciliation(row.PaymentId, row.TransactionId, Enum.Parse<PaymentStatus>(row.Status), row.AuthAmount, row.FirstSentAt, row.RttqAttempts);
+            : new ClaimedReconciliation(row.PaymentId, row.TransactionId, Enum.Parse<PaymentStatus>(row.Status), row.AuthAmount, row.FirstSentAt, row.RttqAttempts, row.OrderNumber);
     }
 
     public async Task<IReadOnlyList<StuckPayment>> FindExpiredLeasesAsync(int limit, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         var rows = await connection.QueryAsync<StuckPayment>(new CommandDefinition(
-            "SELECT id AS PaymentId, attempt_count AS AttemptCount FROM payments WHERE status = 'Submitted' AND lease_until < now() ORDER BY lease_until LIMIT @limit",
+            "SELECT id AS PaymentId, attempt_count AS AttemptCount, transaction_id AS TransactionId, order_number AS OrderNumber FROM payments WHERE status = 'Submitted' AND lease_until < now() ORDER BY lease_until LIMIT @limit",
             new { limit },
             cancellationToken: cancellationToken));
         return rows.ToList();
@@ -476,6 +587,8 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         public DateTimeOffset? FirstSentAt { get; init; }
 
         public int RttqAttempts { get; init; }
+
+        public string? OrderNumber { get; init; }
     }
 
     private sealed class FactRow
@@ -489,11 +602,30 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         public DateTimeOffset? OccurredAt { get; init; }
     }
 
+    private sealed class UnmatchedRow
+    {
+        public long EventId { get; init; }
+
+        public string? Rrn { get; init; }
+
+        public short TypeValue { get; init; }
+
+        public long? AmountMinor { get; init; }
+
+        public string? Currency { get; init; }
+
+        public int Attempts { get; init; }
+
+        public DateTimeOffset ReceivedAt { get; init; }
+    }
+
     private sealed class StateRow
     {
         public string Status { get; init; } = "";
 
         public long? AuthAmount { get; init; }
+
+        public long AmountMinor { get; init; }
 
         public bool NeedsInvestigation { get; init; }
     }

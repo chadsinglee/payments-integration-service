@@ -52,6 +52,9 @@ services:
       Acme__AdviceUsername: ${ACME_ADVICE_USERNAME:-local-advice-user}
       Acme__AdvicePassword: ${ACME_ADVICE_PASSWORD:-local-advice-password}
       Acme__WebhookSecret: ${ACME_WEBHOOK_SECRET:-local-webhook-secret}
+      # One JSON object per line, with the scope (PaymentId, TransactionId, ...) as structured fields.
+      Logging__Console__FormatterName: json
+      Logging__Console__FormatterOptions__IncludeScopes: "true"
     ports:
       - "5001:8080"
     depends_on:
@@ -68,6 +71,10 @@ services:
       ConnectionStrings__Redis: redis:6379
       Acme__ApiKey: ${ACME_API_KEY:-sk_test_stub}
       Acme__MerchantId: ${ACME_MERCHANT_ID:-MID-LOCAL}
+      Logging__Console__FormatterName: json
+      Logging__Console__FormatterOptions__IncludeScopes: "true"
+      # Set to Debug to log each Acme call's dispatch time against its rate-limit token (rate-limit overshoot diagnostics).
+      Logging__LogLevel__Payments.Application.Payments.AcmeGate: ${ACME_GATE_LOG_LEVEL:-Information}
     # Longer than the Acme timeout (40 s) plus the host's 15 s margin, so an in-flight call is recorded before SIGKILL.
     stop_grace_period: 60s
     depends_on:

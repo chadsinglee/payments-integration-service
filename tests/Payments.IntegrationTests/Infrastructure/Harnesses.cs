@@ -51,7 +51,9 @@ public sealed class WorkerHarness : IDisposable
         ReconciliationSettings? reconciliation = null,
         AcmeGateSettings? gate = null,
         IAcmeRateLimiter? limiter = null,
-        string? apiKey = null)
+        string? apiKey = null,
+        LogLevel minimumLevel = LogLevel.Information,
+        TimeProvider? clock = null)
     {
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -64,7 +66,7 @@ public sealed class WorkerHarness : IDisposable
             .Build();
 
         var services = new ServiceCollection();
-        services.AddLogging(logging => logging.AddProvider(Logs));
+        services.AddLogging(logging => logging.SetMinimumLevel(minimumLevel).AddProvider(Logs));
         services.AddSingleton<IConfiguration>(configuration);
         services.AddPaymentsApplication();
         services.AddPaymentSubmission();
@@ -75,6 +77,11 @@ public sealed class WorkerHarness : IDisposable
         services.AddSingleton(limiter ?? new UnlimitedRateLimiter());
         services.AddHttpClient<IAcmeClient, Payments.Infrastructure.Acme.AcmeClient>()
             .ConfigurePrimaryHttpMessageHandler(() => wrap is null ? stub.Server.CreateHandler() : wrap(stub.Server.CreateHandler()));
+        if (clock is not null)
+        {
+            services.AddSingleton(clock);
+        }
+
         Provider = services.BuildServiceProvider();
     }
 
@@ -140,7 +147,7 @@ public sealed class CapturingLoggerProvider : ILoggerProvider
             where TState : notnull
         {
             var previous = owner._scope.Value;
-            owner._scope.Value = state.ToString();
+            owner._scope.Value = previous is null ? state.ToString() : $"{previous} {state}";
             return new Restore(owner, previous);
         }
 
