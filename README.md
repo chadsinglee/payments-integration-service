@@ -64,5 +64,6 @@ See the Commands table in [`AGENTS.md`](AGENTS.md) (unit tests need no infrastru
 - [`docs/spec.md`](docs/spec.md): the authoritative specification
 - [`SOLUTION.md`](SOLUTION.md): design, decisions, domain constraints, diagram, deliverables checklist
 - [`ai/spec-conformance.md`](ai/spec-conformance.md): requirement-by-requirement traceability to the code
+- [`docs/diagrams.md`](docs/diagrams.md): flow diagrams (accept, submit, rate-limit gate, recovery, callbacks, status lifecycle, data model, daily summary)
 - [`ai/`](ai/): AI workflow artifacts (plans, prompts, review notes). The session transcripts in `ai/transcripts/` end on 2026-10-21 at 10:20; the later work (logging pass, `AuthAmount` guard, sweep lock, flaky-test investigation, SQL-side scheduling, PR review) is covered in `ai/sessions/post-slice-hardening.md`.
 - [`docs/ai-template.md`](docs/ai-template.md): the AI repo-starter template this repo was bootstrapped from
