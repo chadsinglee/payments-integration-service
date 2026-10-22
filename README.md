@@ -4,6 +4,8 @@ A .NET 8 service that lets the Zapper app submit and track card payments through
 
 > Status: complete (all nine slices built and verified); post-slice fixes are listed in [`SOLUTION.md` §13](SOLUTION.md#13-fixes-after-delivery), and known risks and follow-ups in §14. See `SOLUTION.md` for design and the deliverables checklist.
 
+Video walkthrough: https://www.loom.com/share/4afceb4e923f48d88dc413f464efe7d7
+
 ## Run locally
 ```powershell
 docker compose up --build -d      # Postgres, Redis, Acme stub, Api (:5001), Worker, stub (:5002)

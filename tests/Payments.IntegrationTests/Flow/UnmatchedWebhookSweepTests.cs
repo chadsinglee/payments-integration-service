@@ -135,6 +135,7 @@ public sealed class UnmatchedWebhookSweepTests(PostgresFixture postgres) : IAsyn
         (await CountAsync("SELECT count(*) FROM payments WHERE needs_investigation")).ShouldBe(1);
         (await CountAsync("SELECT count(*) FROM payment_events WHERE source = 3 AND event_type = 7 AND payment_id IS NOT NULL")).ShouldBe(1);
         harness.Logs.All.ShouldContain("ALERT late webhook");
+        harness.Logs.All.Split("ALERT").Length.ShouldBe(2);
     }
 
     [Fact]

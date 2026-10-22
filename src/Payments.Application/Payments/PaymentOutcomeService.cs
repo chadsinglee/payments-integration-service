@@ -55,7 +55,7 @@ public sealed class PaymentOutcomeService(IPaymentStore store, ILogger<PaymentOu
             {
                 var decision = PaymentStatusRules.Recompute(state.Status, state.AuthAmountMinor, type, facts);
                 var needsInvestigation = decision.NeedsInvestigation || flag;
-                if (needsInvestigation && !state.NeedsInvestigation)
+                if (needsInvestigation && !flag && !state.NeedsInvestigation)
                 {
                     logger.LogError("ALERT payment {PaymentId} flagged for investigation after late {EventType} (status {Status})", paymentId, type, decision.Status);
                 }

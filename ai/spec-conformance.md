@@ -41,7 +41,7 @@ Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.
 | D4 | `ai/` directory | met | plan, sessions, this file |
 | D5 | Exported Acme-client sessions | met, with limits | `ai/transcripts/` holds redacted, mechanically converted transcripts of the whole build session, bootstrap and slices 1-9 plus the close-out (full prompts, answers, assistant text, tool calls and results, see `ai/transcripts/README.md`). `ai/sessions/` holds curated summaries for slices 6-9 only; slices 1-5 have no curated summary, their transcripts are the record. Limits: tool output and arguments over 4000 characters are cut, hidden reasoning and system prompts are not included, and the turn that wrote the export is not in it. The checkpoint summaries are not part of the record |
 | D6 | Single GitHub repository | met | the work is in `chadsinglee/payments-integration-service`; PR #1 was merged into `main` with a regular merge commit |
-| D7 | 5-10 minute video | missing | owner: user |
+| D7 | 5-10 minute video | met | https://www.loom.com/share/4afceb4e923f48d88dc413f464efe7d7 (also linked in `README.md`) |
 | D8 | Personal info removed from sessions | unverifiable | records written without names or paths |
 
 ## Domain constraints
@@ -52,6 +52,6 @@ Redis rate limiter with a shared 429 cooldown, the half-open breaker, lease reva
 
 ## Partial, missing or deferred (proposals)
 1. D6: done. PR #1 was merged into `main` with a regular merge commit.
-2. D7: video, owned by the user.
+2. D7: done. The video is linked in `README.md` and `SOLUTION.md` section 11.
 3. D5: slices 1-5 have transcripts but no curated summary; accept as is.
 4. Accept as deferred: the idle-timeout test; the Compose scenarios (slow stop, hard kill, stub callbacks) were run manually and recorded in `ai/sessions/slice-9-hardening.md`, not automated.
