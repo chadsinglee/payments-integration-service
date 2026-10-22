@@ -280,7 +280,7 @@ Summary [daily-summary-semantics, settlement-cutoff]: SQL over payment facts + e
 - [x] `SOLUTION.md` sections 7-10 complete
 - [x] AI config in tool-expected locations (`AGENTS.md`, `.github/`) present and committed
 - [x] `ai/` directory: plans, redacted session transcripts (`ai/transcripts/`), slice 6-9 summaries and `ai/spec-conformance.md`
-- [x] 5-10 minute video walkthrough (architecture, key decisions/trade-offs, implementation highlights): https://www.loom.com/share/4afceb4e923f48d88dc413f464efe7d7
+- [x] 5-10 minute video walkthrough (architecture, key decisions/trade-offs, implementation highlights): https://www.loom.com/share/4afceb4e923f48d88dc413f464efe7d7 (a copy is in the repo at `docs/walkthrough.mp4`)
 
 ## 12. Open questions
 None blocking. Possible improvement to consider later:
