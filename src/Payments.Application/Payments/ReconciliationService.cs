@@ -190,14 +190,14 @@ public sealed class ReconciliationService(
         }
         catch (Exception)
         {
-            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
         if (!admission.Granted)
         {
             logger.LogInformation("Acme limiter denied RTTQ for payment {PaymentId}; claim released, retry in {RetryAfter}", claimed.PaymentId, admission.RetryAfter);
-            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, timeProvider.GetUtcNow() + admission.RetryAfter, CancellationToken.None);
+            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, admission.RetryAfter, CancellationToken.None);
             return false;
         }
 
@@ -217,7 +217,7 @@ public sealed class ReconciliationService(
         catch (Exception)
         {
             gate.AbandonProbe(admission);
-            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
@@ -245,7 +245,7 @@ public sealed class ReconciliationService(
         if (signal.Kind != AcmeSignalKind.None)
         {
             await gate.ShareCooldownAsync(signal);
-            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, timeProvider.GetUtcNow() + signal.Delay, CancellationToken.None);
+            await store.ReleaseReconciliationAsync(claimed.PaymentId, claimed.RttqAttempts, signal.Delay, CancellationToken.None);
             logger.LogWarning("RTTQ for payment {PaymentId} released after {Signal}; next attempt in {Delay}", claimed.PaymentId, signal.Kind, signal.Delay);
             return true;
         }
@@ -319,16 +319,16 @@ public sealed class ReconciliationService(
 
         // Acme never saw it: resubmit the same TransactionID with a new MessageID (the worker claims it as Pending).
         // The first resend is immediate (the customer is waiting); later ones back off so a gateway that keeps failing is not hammered.
-        var resendAt = claimed.RttqAttempts <= 1 ? now : now + settings.Backoff(claimed.RttqAttempts - 1);
+        var resendIn = claimed.RttqAttempts <= 1 ? TimeSpan.Zero : settings.Backoff(claimed.RttqAttempts - 1);
         logger.LogInformation(
-            "RTTQ 404 for payment {PaymentId}: resending the same TransactionId with a new MessageId at {ResendAt:O} (attempt {AttemptCount})",
-            claimed.PaymentId, resendAt, claimed.RttqAttempts);
+            "RTTQ 404 for payment {PaymentId}: resending the same TransactionId with a new MessageId in {ResendIn} (attempt {AttemptCount})",
+            claimed.PaymentId, resendIn, claimed.RttqAttempts);
         var resend = SystemEvent(PaymentEventType.Informational, $"rttq-resend:{claimed.PaymentId}:{claimed.RttqAttempts}", "rttq-404-resend");
         await outcomes.ApplyAsync(
             claimed.PaymentId,
             resend,
             (state, update) => state.Status == PaymentStatus.Unknown
-                ? update with { Status = PaymentStatus.Pending, Reconciliation = ReconciliationState.None, NextAttemptAt = resendAt }
+                ? update with { Status = PaymentStatus.Pending, Reconciliation = ReconciliationState.None, NextAttemptIn = resendIn }
                 : update,
             CancellationToken.None);
     }
@@ -362,7 +362,7 @@ public sealed class ReconciliationService(
 
         if (claimed.RttqAttempts < settings.MaxAttempts && !(giveUpIfUnknown && update.Status == PaymentStatus.Unknown))
         {
-            return update with { Reconciliation = ReconciliationState.InProgress, NextAttemptAt = timeProvider.GetUtcNow() + settings.Backoff(claimed.RttqAttempts) };
+            return update with { Reconciliation = ReconciliationState.InProgress, NextAttemptIn = settings.Backoff(claimed.RttqAttempts) };
         }
 
         logger.LogError("ALERT payment {PaymentId} could not be reconciled after {AttemptCount} RTTQ attempt(s) ({Reason}); needs investigation", claimed.PaymentId, claimed.RttqAttempts, reason);

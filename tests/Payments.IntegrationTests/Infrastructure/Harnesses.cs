@@ -52,7 +52,8 @@ public sealed class WorkerHarness : IDisposable
         AcmeGateSettings? gate = null,
         IAcmeRateLimiter? limiter = null,
         string? apiKey = null,
-        LogLevel minimumLevel = LogLevel.Information)
+        LogLevel minimumLevel = LogLevel.Information,
+        TimeProvider? clock = null)
     {
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -76,6 +77,11 @@ public sealed class WorkerHarness : IDisposable
         services.AddSingleton(limiter ?? new UnlimitedRateLimiter());
         services.AddHttpClient<IAcmeClient, Payments.Infrastructure.Acme.AcmeClient>()
             .ConfigurePrimaryHttpMessageHandler(() => wrap is null ? stub.Server.CreateHandler() : wrap(stub.Server.CreateHandler()));
+        if (clock is not null)
+        {
+            services.AddSingleton(clock);
+        }
+
         Provider = services.BuildServiceProvider();
     }
 

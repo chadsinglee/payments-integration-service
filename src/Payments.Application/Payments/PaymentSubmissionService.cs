@@ -11,7 +11,6 @@ public sealed class PaymentSubmissionService(
     IAcmeClient acmeClient,
     AcmeGate gate,
     PaymentOutcomeService outcomes,
-    TimeProvider timeProvider,
     ILogger<PaymentSubmissionService> logger)
 {
     /// <summary>Claims and submits one due payment. Returns false when nothing was submitted (nothing due, or Acme calls are paused).</summary>
@@ -42,14 +41,14 @@ public sealed class PaymentSubmissionService(
         }
         catch (Exception)
         {
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
         if (!admission.Granted)
         {
             logger.LogInformation("Acme limiter denied payment {PaymentId}; claim released, retry in {RetryAfter}", claimed.PaymentId, admission.RetryAfter);
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow() + admission.RetryAfter, CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, admission.RetryAfter, CancellationToken.None);
             return false;
         }
 
@@ -75,7 +74,7 @@ public sealed class PaymentSubmissionService(
         catch (Exception)
         {
             gate.AbandonProbe(admission);
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow(), CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, TimeSpan.Zero, CancellationToken.None);
             throw;
         }
 
@@ -102,7 +101,7 @@ public sealed class PaymentSubmissionService(
         if (signal.Kind != AcmeSignalKind.None)
         {
             await gate.ShareCooldownAsync(signal);
-            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, timeProvider.GetUtcNow() + signal.Delay, CancellationToken.None);
+            await store.ReleaseClaimAsync(claimed.PaymentId, claimed.AttemptCount, signal.Delay, CancellationToken.None);
             logger.LogWarning(
                 "Payment {PaymentId} released to Pending after {Signal}; next attempt in {Delay}",
                 claimed.PaymentId,

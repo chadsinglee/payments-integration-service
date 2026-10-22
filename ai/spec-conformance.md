@@ -1,6 +1,6 @@
 # Spec conformance (final check)
 
-Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 155 unit and 159 integration tests, and `dotnet format --verify-no-changes` were run after the last change (post-review fixes: webhook amount parsing, reversal/refund validation, PEND/COMPL classification, audit email redaction, localhost-only Compose ports); the Docker Compose smoke test passed before those fixes and was not re-run (see `ai/sessions/slice-9-hardening.md`).
+Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 155 unit and 160 integration tests, and `dotnet format --verify-no-changes` were run after the last change (post-review fixes: webhook amount parsing, reversal/refund validation, PEND/COMPL classification, audit email redaction, localhost-only Compose ports); the Docker Compose smoke test passed before those fixes and was not re-run (see `ai/sessions/slice-9-hardening.md`).
 
 ## Functional requirements
 | # | Requirement | Code | Proof | Status |

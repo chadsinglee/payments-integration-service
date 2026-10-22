@@ -103,7 +103,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 new SubMerchant(row.SubMerchantId, row.TradingName, row.City, row.Region, row.Country, row.Mcc));
     }
 
-    public async Task ReleaseClaimAsync(Guid paymentId, int attemptCount, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken)
+    public async Task ReleaseClaimAsync(Guid paymentId, int attemptCount, TimeSpan delay, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await connection.ExecuteAsync(new CommandDefinition(
@@ -114,11 +114,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 first_sent_at = CASE WHEN attempt_count = 1 THEN NULL ELSE first_sent_at END,
                 lease_until = NULL,
                 deferred_at = now(),
-                next_attempt_at = @nextAttemptAt,
+                next_attempt_at = now() + make_interval(secs => @delaySeconds),
                 updated_at = now()
             WHERE id = @paymentId AND status = 'Submitted' AND attempt_count = @attemptCount
             """,
-            new { paymentId, attemptCount, nextAttemptAt = nextAttemptAt.ToUniversalTime() },
+            new { paymentId, attemptCount, delaySeconds = delay.TotalSeconds },
             cancellationToken: cancellationToken));
     }
 
@@ -152,7 +152,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
         return extended == 1;
     }
 
-    public async Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken)
+    public async Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan delay, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await connection.ExecuteAsync(new CommandDefinition(
@@ -160,11 +160,11 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             UPDATE payments
             SET rttq_attempts = rttq_attempts - 1,
                 reconciliation_state = CASE WHEN rttq_attempts = 1 THEN 'None' ELSE reconciliation_state END,
-                next_attempt_at = @nextAttemptAt,
+                next_attempt_at = now() + make_interval(secs => @delaySeconds),
                 updated_at = now()
             WHERE id = @paymentId AND reconciliation_state = 'InProgress' AND rttq_attempts = @rttqAttempts
             """,
-            new { paymentId, rttqAttempts, nextAttemptAt = nextAttemptAt.ToUniversalTime() },
+            new { paymentId, rttqAttempts, delaySeconds = delay.TotalSeconds },
             cancellationToken: cancellationToken));
     }
 
@@ -329,7 +329,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 auth_amount = COALESCE(auth_amount, @authAmount),
                 needs_investigation = needs_investigation OR @needsInvestigation,
                 reconciliation_state = COALESCE(@reconciliation, CASE WHEN status <> @status THEN 'None' ELSE reconciliation_state END),
-                next_attempt_at = COALESCE(@nextAttemptAt, next_attempt_at),
+                next_attempt_at = COALESCE(now() + make_interval(secs => @nextAttemptDelaySeconds), next_attempt_at),
                 lease_until = CASE WHEN @status = 'Submitted' THEN lease_until ELSE NULL END,
                 updated_at = now()
             WHERE id = @paymentId
@@ -341,7 +341,7 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
                 authAmount = update.AuthAmountMinor,
                 needsInvestigation = update.NeedsInvestigation,
                 reconciliation = update.Reconciliation?.ToString(),
-                nextAttemptAt = update.NextAttemptAt?.ToUniversalTime(),
+                nextAttemptDelaySeconds = update.NextAttemptIn?.TotalSeconds,
             },
             transaction,
             cancellationToken: cancellationToken));

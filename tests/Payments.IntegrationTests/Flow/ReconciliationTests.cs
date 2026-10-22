@@ -115,6 +115,21 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
     }
 
     [Fact]
+    public async Task Reconcile_WhenTheAppClockIsAheadOfTheDatabase_TheImmediateResendIsStillClaimableAtOnce()
+    {
+        await Post("pay-1", StubAmounts.FirstPostFails);
+        using var harness = new WorkerHarness(_connectionString, _stub, clock: new OffsetTimeProvider(TimeSpan.FromSeconds(30)));
+        await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None);
+        await MakeDue();
+
+        await harness.Reconciliation.ReconcileNextAsync(Lease, CancellationToken.None);
+
+        (await Row("pay-1")).Status.ShouldBe("Pending");
+        (await harness.Submissions.SubmitNextAsync(Lease, CancellationToken.None)).ShouldBeTrue();
+        (await Row("pay-1")).Status.ShouldBe("Approved");
+    }
+
+    [Fact]
     public async Task Reconcile_WhenAcmeNeverSawThePostAfterTheWindow_StopsFlaggedAndStaysUnknown()
     {
         await Post("pay-1", StubAmounts.FirstPostFails);
@@ -481,7 +496,11 @@ public sealed class ReconciliationTests(PostgresFixture postgres) : IAsyncLifeti
         await connection.ExecuteAsync(sql);
     }
 
-    // The immediate resend is stamped with the app clock and claimed against the database clock, which can differ by about a millisecond.
+    private sealed class OffsetTimeProvider(TimeSpan offset) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + offset;
+    }
+
     private static async Task SubmitWhenClaimableAsync(WorkerHarness harness)
     {
         var deadline = DateTime.UtcNow.AddSeconds(10);

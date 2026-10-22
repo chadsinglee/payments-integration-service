@@ -59,7 +59,7 @@ public sealed record PaymentUpdate(
     long? AuthAmountMinor,
     bool NeedsInvestigation,
     ReconciliationState? Reconciliation = null,
-    DateTimeOffset? NextAttemptAt = null,
+    TimeSpan? NextAttemptIn = null,
     bool AuthAmountRejected = false);
 
 public sealed record ClaimedReconciliation(

@@ -21,7 +21,7 @@ public interface IPaymentStore
     /// Puts a claimed payment back to Pending without having called Acme (or after Acme rejected the call without processing it:
     /// 401, 429). The attempt is not counted. Does nothing when the payment has moved on (a callback resolved it).
     /// </summary>
-    Task ReleaseClaimAsync(Guid paymentId, int attemptCount, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken);
+    Task ReleaseClaimAsync(Guid paymentId, int attemptCount, TimeSpan delay, CancellationToken cancellationToken);
 
     /// <summary>
     /// Ownership check and lease renewal in one statement, run immediately before the POST. True only when this worker still owns
@@ -33,8 +33,8 @@ public interface IPaymentStore
     /// <summary>The same check for an RTTQ claim (still InProgress on this attempt and not yet due for another worker).</summary>
     Task<bool> ExtendReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan lease, CancellationToken cancellationToken);
 
-    /// <summary>The same for an RTTQ claim: the attempt is given back and the payment is due again at <paramref name="nextAttemptAt"/>.</summary>
-    Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, DateTimeOffset nextAttemptAt, CancellationToken cancellationToken);
+    /// <summary>The same for an RTTQ claim: the attempt is given back and the payment is due again after <paramref name="delay"/> (computed on the database clock).</summary>
+    Task ReleaseReconciliationAsync(Guid paymentId, int rttqAttempts, TimeSpan delay, CancellationToken cancellationToken);
 
     /// <summary>
     /// Locks the payment row, appends the event, recomputes status with <paramref name="decide"/> and commits in one
