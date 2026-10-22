@@ -21,7 +21,7 @@ public sealed class StubState
     // First POST per TransactionID is rate limited (429/E29, Retry-After 1) and not stored; later POSTs behave normally.
     public const long FirstPostRateLimitedAmount = 99_429;
 
-    // Acme can hold a request for up to 30 s; this answers normally after SlowDelay (default 35 s, above the client timeout's 30 s floor).
+    // Acme can hold a request for up to 30 s; this answers normally after SlowDelay (default 35 s, inside the Api's default 40 s client timeout).
     public const long SlowAmount = 99_035;
 
     public TimeSpan SlowDelay { get; set; } = TimeSpan.FromSeconds(35);

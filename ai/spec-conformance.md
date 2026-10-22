@@ -1,6 +1,6 @@
 # Spec conformance (final check)
 
-Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 155 unit and 160 integration tests, and `dotnet format --verify-no-changes` were run after the last change (post-review fixes: webhook amount parsing, reversal/refund validation, PEND/COMPL classification, audit email redaction, localhost-only Compose ports); the Docker Compose smoke test passed before those fixes and was not re-run (see `ai/sessions/slice-9-hardening.md`).
+Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.md`, the plan, `src/` and `tests/`, then corrected by the build owner. Build, 155 unit and 160 integration tests, and `dotnet format --verify-no-changes` were run after the last change (post-review fixes: webhook amount parsing, reversal/refund validation, PEND/COMPL classification, audit email redaction, localhost-only Compose ports); the Docker Compose smoke test was re-run on the final `main` (fresh stack: approve, decline, 429 retry, summary, and `ai/demo.ps1` passing 22 of 22); the slice-9 run in `ai/sessions/slice-9-hardening.md` predates later fixes.
 
 ## Functional requirements
 | # | Requirement | Code | Proof | Status |
@@ -18,7 +18,7 @@ Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.
 | F11 | Acme timeout | `AcmeClient`, `ReconciliationService` | `ReconciliationTests`, `AcmeClientTests` | met |
 | F12 | Acme stub (Appendix A) | `src/Acme.Stub` | `StubTests` | met |
 | F13 | Task 1 assumptions and stub behaviours | `SOLUTION.md` 9 | n/a | met |
-| F14 | Schema and migrations | `Schema/v1/V1_00`-`V1_05` | `SchemaTests` | met |
+| F14 | Schema and migrations | `Schema/v1/V1_00`-`V1_06` | `SchemaTests` | met |
 | F15 | Daily summary + committed query | `sql/daily-summary.sql`, `SummaryEndpoints.cs` | `DailySummaryTests` | met |
 | F16 | Data model explanation | `SOLUTION.md` 7 | n/a | met |
 | F17 | Public callbacks with Basic and HMAC auth | `CallbackEndpoints.cs` | callback auth tests | met |
@@ -37,7 +37,7 @@ Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.
 | N8 | AWS approach incl. graceful shutdown | met | `SOLUTION.md` 8; shutdown settings tested |
 | D1 | Source code | met | |
 | D2 | `SOLUTION.md` complete | met | sections 1-11 |
-| D3 | AI config in tool-expected locations | met | `AGENTS.md`, `.github/` committed on branch `feature/payments-submission` |
+| D3 | AI config in tool-expected locations | met | `AGENTS.md`, `.github/` committed on `main` |
 | D4 | `ai/` directory | met | plan, sessions, this file |
 | D5 | Exported Acme-client sessions | met, with limits | `ai/transcripts/` holds redacted, mechanically converted transcripts of the whole build session, bootstrap and slices 1-9 plus the close-out (full prompts, answers, assistant text, tool calls and results, see `ai/transcripts/README.md`). `ai/sessions/` holds curated summaries for slices 6-9 only; slices 1-5 have no curated summary, their transcripts are the record. Limits: tool output and arguments over 4000 characters are cut, hidden reasoning and system prompts are not included, and the turn that wrote the export is not in it. The checkpoint summaries are not part of the record |
 | D6 | Single GitHub repository | met | the work is in `chadsinglee/payments-integration-service`; PR #1 was merged into `main` with a regular merge commit |
@@ -51,7 +51,7 @@ All 19 constraints in `SOLUTION.md` section 2 are met, each with code and test a
 Redis rate limiter with a shared 429 cooldown, the half-open breaker, lease revalidation, reconciliation worker, pending expiry, `needs_investigation`, `rejected_callbacks` and `event_conflicts`, settlement cutoff and late fields, observed reversal/refund events, stub admin endpoints, `/health`. Each is recorded as a decision in `SOLUTION.md`.
 
 ## Partial, missing or deferred (proposals)
-1. D6: commit and push to GitHub once the user confirms (not done by request).
+1. D6: done. PR #1 was merged into `main` with a regular merge commit.
 2. D7: video, owned by the user.
 3. D5: slices 1-5 have transcripts but no curated summary; accept as is.
 4. Accept as deferred: the idle-timeout test; the Compose scenarios (slow stop, hard kill, stub callbacks) were run manually and recorded in `ai/sessions/slice-9-hardening.md`, not automated.

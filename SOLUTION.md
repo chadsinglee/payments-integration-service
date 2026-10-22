@@ -184,28 +184,57 @@ Summary [daily-summary-semantics, settlement-cutoff]: SQL over payment facts + e
 **Evolution.** Add columns with new `V1_nn`/`V2_nn` scripts (additive first, then backfill, then constrain); build indexes `CONCURRENTLY` on live tables. Partition `payment_events` and `acme_interactions` by month and archive old partitions. Move the summary to a reader replica or a materialised table when volume requires. Replace polling with SQS dispatch (events written by the outcome path) if latency matters, keeping Postgres as the source of truth.
 
 ## 8. AWS deployment approach
-- **Compute:** ECS Fargate: Api service behind an ALB (public callbacks and app traffic; Acme callbacks restricted by Basic auth and HMAC, optionally by WAF), Worker service with no inbound traffic. The same images as Compose.
-- **Data:** RDS PostgreSQL (Multi-AZ, automated backups, point-in-time recovery); ElastiCache Redis for the shared limiter (a small replicated node; the service tolerates its loss).
-- **Config and secrets:** Secrets Manager or SSM Parameter Store injected as environment variables into the task definitions (Acme API key, advice credentials, webhook secret, connection strings). Nothing is baked into images.
-- **Scaling:** Api on CPU/request count; Worker on the age of the oldest `Pending` payment. Adding workers never exceeds Acme's limit because the budget (default 15 per second across all workers) lives in Redis. Several Workers are also safe for the unmatched-event sweep, which runs under a transaction-level Postgres advisory lock (a worker that does not get the lock skips the pass), so attempt counters and give-up `ALERT`s are not duplicated.
-- **If ElastiCache is down:** outbound Acme calls pause (nothing is claimed while the limiter is unavailable) and no payment is lost. Alarm on Redis availability, because a long outage stalls all submissions.
-- **Dispatch (Postgres polling now, SQS later):** workers poll Postgres. I would move dispatch to SQS when dispatch latency or throughput outgrows Postgres polling, keeping Postgres as the source of truth for payment state and the audit trail (the queue would only carry "work is ready").
-- **TLS and caller auth:** the ALB terminates TLS. The app-facing API has no caller authentication today, and it is needed before production (see §14.2).
-- **Graceful shutdown:** on a scale-in or deploy ECS sends SIGTERM; the worker stops claiming, lets an in-flight Acme call finish and records it. Set the container `stopTimeout` (max 120 s) above the worker's `Acme timeout + 15 s` host timeout (55 s by default); the Compose equivalent is `stop_grace_period: 60s`. Anything cut off by a hard kill is recovered by lease expiry and RTTQ, never resent blindly. Deploy rolling, with new tasks healthy before old ones drain.
-- **Signals:** structured logs, one JSON object per line in Compose (`Logging__Console__FormatterName=json`, scopes included) for CloudWatch. Every payment line carries the same property names: `PaymentId` and `TransactionId` (and `OrderNumber`, `AttemptCount`) in scope, `MessageId` around each Acme call, `Source` and `DedupKey` on callbacks, so one payment can be followed across Api, worker and callbacks by `PaymentId`. Each status change is one Information line (`OldStatus`, `NewStatus`, reason such as `post-response`, `rttq-found`, `webhook`, `lease-expired`, `rttq-resend`); Warning for 429, unmatched events, rejected or turned-away callbacks and limiter/Redis problems; Error only for the `ALERT` lines a person must act on; per-poll and per-token detail at Debug. The card token, API key, HMAC secret, Basic credentials and request/response bodies are never logged (`LoggingTests`). See the next bullets for what is built and what is proposed.
-- **Operability, built (local build):** structured JSON logs on stdout only (Compose sets the JSON console formatter). There is **no metrics exporter and no metrics endpoint** in the code. `ALERT` lines at Error mark everything a person must act on.
-- **Operability, proposed (AWS default: CloudWatch, not built).**
-  - *Logs:* JSON to stdout, shipped by the ECS `awslogs` driver to CloudWatch Logs and queried with Logs Insights by `PaymentId`, `TransactionId` and `OrderNumber`.
-  - *First metrics, no code change:* CloudWatch metric filters on the existing `ALERT` lines (conflicts, `AuthAmount` above `Amount`, unmatched-sweep give-ups, resend exhaustion, 401 from Acme), plus filters on the existing Warning lines for 429, limiter denial and limiter unavailable.
-  - *Next step, needs code:* Embedded Metric Format (EMF) log lines for custom metrics, with few dimensions (for example `Service` and `Outcome`). `PaymentId`, `TransactionId` and `OrderNumber` are never dimensions (unbounded cardinality).
-  - *Alarms via SNS:* flagged payments above zero; oldest `Unknown`/`Submitted` age; limiter denials and Acme 429s; RTTQ calls by result; callbacks by outcome; unmatched events waiting; resend count. Those that count rows or ages (flagged, oldest age, unmatched waiting) need EMF from a periodic query; the rest can start as metric filters. ALB 5xx and ECS task health are the built-in signals.
-  - *Why CloudWatch:* native to AWS, no agent or extra component to run, log data and credentials stay inside the account (relevant for a payments service), and it integrates directly with SNS and ECS.
-  - *Cost:* log ingestion is the main cost. Mitigate with Information-level logging in production, a retention period, few metric dimensions and the Infrequent Access log class for rarely queried logs. If volume or cost became a problem, ship logs to a cheaper backend such as Axiom or Grafana Loki and keep CloudWatch for alarms and the built-in AWS metrics.
+> The local build proves the payment logic: leases, RTTQ reconciliation, idempotent callbacks and the shared rate limit. This section is how I would run it on AWS in production. Where it says "built" the code does it today; everything else is proposed and not built.
+
+### 8.1 Topology
+- **Accounts:** separate AWS accounts for dev, staging and prod. Prod is only reachable through the pipeline.
+- **Network:** one VPC across three AZs. Only the ALB and the NAT gateways are public. ECS tasks, RDS and Redis sit in private subnets, with a security group per tier. Calls to Acme leave through NAT on fixed elastic IPs, so Acme can allow-list them. VPC endpoints for ECR, S3, Secrets Manager and CloudWatch keep that traffic off the internet.
+- **Edge:** Route 53 in front of an ALB with AWS WAF (rate rules and managed rule sets). TLS ends at the ALB with ACM certificates.
+- **Compute:** ECS Fargate. The Api runs as a service behind the ALB (app traffic and Acme callbacks), at least two tasks across AZs. The Worker runs as a service with no inbound traffic, at least two tasks. Same images as Compose, promoted by digest.
+- **Data:** RDS PostgreSQL, Multi-AZ, automated backups and point-in-time recovery, behind RDS Proxy. ElastiCache Redis with a replica and automatic failover for the shared limiter (the service tolerates its loss).
+
+### 8.2 Config, secrets and security
+- **Config and secrets:** Secrets Manager or SSM Parameter Store inject the Acme API key, advice credentials, webhook secret and connection strings as environment variables in the task definitions. Nothing is baked into images. The database password rotates automatically. The Acme API key and HMAC secret rotate on a schedule, with an overlap window where old and new are both accepted.
+- **App callers:** the app API goes behind OIDC/JWT validation (API Gateway or ALB authentication) with scopes per caller. Today it has no caller auth.
+- **Acme callbacks:** Basic auth on advices and HMAC on webhooks (built). If Acme publishes its source IPs, add a WAF rule limiting the callback paths to them.
+- **Encryption:** KMS at rest for RDS, Redis, S3 and the logs. TLS in transit everywhere, including RDS (`sslmode=verify-full`) and Redis.
+- **PCI scope:** we store card tokens only, never card numbers, which keeps us out of most cardholder-data scope. I would confirm the scope statement and its owner with whoever handles compliance. The card token, API key, HMAC secret, Basic credentials and request/response bodies are never logged (`LoggingTests`).
+- **Least privilege:** one IAM task role per service, and separate database roles for the Api and the Worker. Nobody has DDL rights at runtime.
+- **Retention:** retention periods for emails and audit rows get agreed with privacy and finance. Old partitions are archived to S3 (encrypted, object lock) rather than deleted, which fits `no-lost-audit`.
+- **Detection:** CloudTrail, GuardDuty and AWS Config on the accounts, and image scanning in ECR.
+
+### 8.3 Reliability and disaster recovery
+- **Targets:** I would aim for an RPO of about 5 minutes (PITR) and an RTO of about an hour. These are my proposals and would need agreeing with the business. Multi-AZ covers losing an AZ, with a failover of a minute or two.
+- **Failure behaviour is designed in (built).** A Postgres failover or a killed worker leaves leases that expire, and RTTQ resolves them without a resend. Losing Redis pauses outbound calls and loses no data. An Acme outage opens the breaker and payments wait in `Pending`.
+- **Graceful shutdown:** on a scale-in or deploy ECS sends SIGTERM; the worker stops claiming, lets an in-flight Acme call finish and records it. Set the container `stopTimeout` (max 120 s) above the worker's `Acme timeout + 15 s` host timeout (55 s by default); the Compose equivalent is `stop_grace_period: 60s`. Anything cut off by a hard kill is recovered by lease expiry and RTTQ, never resent blindly.
+- **Regional DR:** cross-region backups, and infrastructure as code that can be deployed to a second region. A restore drill every quarter, with the result written down.
+- **Migrations:** a one-off ECS task in the pipeline, run before the new version rolls out, instead of at Api startup, where several replicas would race. Additive changes first, then backfill, then constrain. Indexes built `CONCURRENTLY`.
+- **Deploys:** rolling or blue/green, new tasks healthy before old ones drain, with automatic rollback on a failed health check or alarm.
+
+### 8.4 Delivery and operations
+- **Pipeline:** build, format check, unit and integration tests, dependency and image scan, push to ECR, deploy to staging, run a smoke test script, manual approval, deploy to prod, roll back on alarm. Staging talks to the Acme sandbox.
+- **Infrastructure as code:** Terraform or CDK for all of the above, with plan review and drift detection.
+- **Signals (built):** structured logs, one JSON object per line in Compose (`Logging__Console__FormatterName=json`, scopes included). Every payment line carries the same property names: `PaymentId` and `TransactionId` (and `OrderNumber`, `AttemptCount`) in scope, `MessageId` around each Acme call, `Source` and `DedupKey` on callbacks, so one payment can be followed across Api, worker and callbacks by `PaymentId`. Each status change is one Information line (`OldStatus`, `NewStatus`, reason such as `post-response`, `rttq-found`, `webhook`, `lease-expired`, `rttq-resend`); Warning for 429, unmatched events, rejected or turned-away callbacks and limiter/Redis problems; Error only for the `ALERT` lines a person must act on; per-poll and per-token detail at Debug.
+- **Operability, built:** JSON logs on stdout only. There is **no metrics exporter and no metrics endpoint** in the code. `ALERT` lines at Error mark everything a person must act on.
+- **Operability, proposed (CloudWatch, not built):**
+  - *Logs:* JSON to stdout, shipped by the ECS `awslogs` driver to CloudWatch Logs, queried with Logs Insights by `PaymentId`, `TransactionId` and `OrderNumber`. Retention set.
+  - *First metrics, no code change:* CloudWatch metric filters on the existing `ALERT` lines (conflicts, `AuthAmount` above `Amount`, sweep give-ups, resend exhaustion, 401 from Acme) and on the Warning lines for 429, limiter denial and limiter unavailable.
+  - *Next step, needs code:* Embedded Metric Format (EMF) lines for custom metrics, with few dimensions (for example `Service` and `Outcome`). `PaymentId`, `TransactionId` and `OrderNumber` are never dimensions (unbounded cardinality). OpenTelemetry traces to X-Ray with `PaymentId` as an attribute.
+  - *Alarms via SNS to on-call:* flagged (`needs_investigation`) payments above zero; age of the oldest `Pending`, `Submitted` or `Unknown` payment; Acme 429s, limiter denials, breaker open and 401s; RTTQ calls by result; unmatched webhooks waiting and sweep give-ups; callback rejections; ALB 5xx, ECS task health, RDS CPU, connections and storage; Redis availability (if it is down, outbound calls pause). Alarms that count rows or ages need EMF from a periodic query; the rest can start as metric filters.
+  - *SLO:* most payments reach a final state within a couple of minutes, and every payment either gets there inside the resend window or is flagged. The exact figures would be agreed with the business.
+  - *Why CloudWatch:* native to AWS, nothing extra to run, log data and credentials stay inside the account (relevant for a payments service), and it integrates directly with SNS and ECS.
+  - *Cost:* log ingestion is the main cost. Mitigate with Information-level logging in production, a retention period, few metric dimensions and the Infrequent Access log class. If volume became a problem, ship logs to a cheaper backend such as Axiom or Grafana Loki and keep CloudWatch for alarms and AWS metrics.
+- **Runbooks:** one per `ALERT` line (conflicting outcomes, `AuthAmount` above `Amount`, resend exhausted, sweep give-up, Acme 401). Each says what it means, how to check what Acme has (RTTQ or the portal) and who decides the outcome. The design hands these cases to a person, so the runbooks are part of the system.
+- **Finance reconciliation:** a daily job compares our summary with Acme's settlement files and reports any difference. It is the independent check that our totals are right.
+
+### 8.5 Scale and capacity
+- Acme's 20 requests per second (POST and RTTQ together) is the ceiling. At the default of 15 per second that is roughly 15 submissions a second, about 1.3 million a day if there is no RTTQ traffic. Postgres handles that easily.
+- **Scaling:** the Worker scales on the age of the oldest `Pending` payment. Adding workers never exceeds Acme's limit, because the budget (default 15 per second across all workers) lives in Redis. Several workers are safe because the unmatched-event sweep runs under a transaction-level Postgres advisory lock (a worker that does not get it skips the pass), so attempts and give-up `ALERT`s are not duplicated. The Api scales on CPU and request count. RDS Proxy keeps connections under the Postgres limit as tasks grow (the code caps the pool at 40 per process).
+- **Dispatch:** workers poll Postgres today. I would move dispatch to SQS when dispatch latency or throughput outgrows polling, or if Acme raises its limit, keeping Postgres as the source of truth for payment state and the audit trail (the queue only says "work is ready"). Paced dispatch is described in section 12. If the summary gets slow, use a reader replica or a materialised table.
 - Other signals to watch: Acme latency, breaker and limiter pauses, callback rejections, RDS CPU and connections, Redis availability.
-- **Network:** private subnets for Worker, RDS and Redis; egress to Acme through a NAT gateway (a fixed IP Acme can allow-list); security groups per tier.
 
 ## 9. Assumptions and Acme stub behaviours
-**Stub behaviours** (`src/Acme.Stub`, `stub-scenario-control`; amounts in cents, all otherwise approve): `99005` decline 05; `99051` decline 51; `99422` application failure; `99409` foreign RRN in the response; `99503` gateway error 503 (outcome `Unknown`); `99502` fails the first POST per `TransactionID` (RTTQ 404, then resend); `99429` 429 with `Retry-After: 1` on the first POST per `TransactionID`; `99035` answers after 35 s (client timeout, then RTTQ finds the approval). Admin: `POST /admin/rttq-processing/{transactionId}?count=n`, `POST /admin/outcomes/{transactionId}/status?value=Reversed|Refunded|Complete`, `GET /admin/posts`.
+**Stub behaviours** (`src/Acme.Stub`, `stub-scenario-control`; amounts in cents, all otherwise approve): `99005` decline 05; `99051` decline 51; `99422` application failure; `99409` foreign RRN in the response; `99503` gateway error 503 (outcome `Unknown`); `99502` fails the first POST per `TransactionID` (RTTQ 404, then resend); `99429` 429 with `Retry-After: 1` on the first POST per `TransactionID`; `99035` answers after 35 s (inside the default 40 s client timeout, so it is approved from the response; set `Acme__TimeoutSeconds` below 35 to force a timeout and an RTTQ lookup). Admin: `POST /admin/rttq-processing/{transactionId}?count=n`, `POST /admin/outcomes/{transactionId}/status?value=Reversed|Refunded|Complete`, `GET /admin/posts`.
 
 **Assumptions.**
 - The spec's `CardAcceptorName` example is not 40 characters; treated as transcription whitespace loss, so the formatter pads to 40.
@@ -222,13 +251,17 @@ Summary [daily-summary-semantics, settlement-cutoff]: SQL over payment facts + e
 ## 10. AI tools, workflow and validation
 **Tools and context.** GitHub Copilot CLI (Claude models) with the repo's AI starter template: `AGENTS.md`, instruction packs in `.github/instructions/`, skills (`bootstrap-repo`, `scaffold-from-spec`) and a `planner` and `code-reviewer` agent. The spec (`docs/spec.md`) was the only requirements source; every decision is named in section 3.
 
-**Workflow.** Bootstrap produced the decisions and diagram (critiqued by the planner agent), then a nine-slice plan (`ai/implementation-plan.md`) was approved. Each slice was built vertically (foundation and submit-and-approve first), gated by build, tests and `dotnet format --verify-no-changes`, independently reviewed by a fresh-context reviewer, then approved by me before the next. Full redacted transcripts of the session are in `ai/transcripts/` and end on 2026-10-21 at 10:20; the later work (logging pass, `AuthAmount` guard, sweep lock, flaky-test investigation, SQL-side scheduling, PR review) is covered in `ai/sessions/post-slice-hardening.md`. Per-slice summaries with review tables for slices 6-9 are in `ai/sessions/`; the final planner conformance table is `ai/spec-conformance.md`.
+**Workflow.** Bootstrap produced the decisions and diagram (critiqued by the planner agent), then a nine-slice plan (`ai/implementation-plan.md`) was approved. Each slice was built vertically (foundation and submit-and-approve first), gated by build, tests and `dotnet format --verify-no-changes`, independently reviewed by a fresh-context reviewer, then approved by me before the next. Full redacted transcripts of the session are in `ai/transcripts/` and end on 2026-10-21 at 10:20; the fixes made after that (logging pass, `AuthAmount` guard, sweep lock, SQL-side scheduling) are recorded in section 13. Per-slice summaries with review tables for slices 6-9 are in `ai/sessions/`; the final planner conformance table is `ai/spec-conformance.md`.
 
 **Delegated vs my own.** The assistant wrote code, tests and docs; I made the product decisions (no blind resend, unresolved handling, rate limit, resend window, deferred items) and approved each slice. Constraints such as never retrying a POST and never changing a `TransactionID` came from the spec and were enforced by tests.
 
-**Validation.** Unit and integration tests (Testcontainers Postgres and Redis), a DI smoke test of the worker graph, a Docker Compose smoke test (a manual procedure, with no script in the repo) covering approve, decline, 429 retry, summary, secret scan of logs, graceful stop; stub-emitted duplicate, out-of-order, refund and reversal callbacks; stop during a 35 s in-flight call; hard kill recovered through lease expiry and RTTQ with no second POST; and independent review every slice. Reviews caught real defects that I would not have accepted: a payment counted as both approved and declined, undated events landing on the wrong summary day, a worker able to POST after its lease expired, and a Dockerfile missing `sql/` (found only by the compose build).
+**Validation.** Unit and integration tests (Testcontainers Postgres and Redis), a DI smoke test of the worker graph, a Docker Compose smoke test (`ai/demo.ps1` for most of it; graceful stop and hard kill are manual) covering approve, decline, 429 retry, summary, secret scan of logs, graceful stop; stub-emitted duplicate, out-of-order, refund and reversal callbacks; stop during a 35 s in-flight call; hard kill recovered through lease expiry and RTTQ with no second POST; and independent review every slice. Reviews caught real defects that I would not have accepted: a payment counted as both approved and declined, undated events landing on the wrong summary day, a worker able to POST after its lease expired, and a Dockerfile missing `sql/` (found only by the compose build).
 
-**What I would do differently.** Run the compose smoke test every slice rather than at the end, and write the lease-ownership tests when leases were introduced.
+**What I would do differently.**
+- Run the Compose smoke test every slice rather than once at the end, and keep it as a script in the repo instead of a manual procedure.
+- Write the lease-ownership and multi-worker tests when I introduced leases, not after review.
+- Test for app-clock against database-clock mixing from the start. It caused the one flaky test.
+- Run migrations as a pipeline step from day one.
 
 ## 11. Deliverables checklist
 - [x] All source code: `src/` projects per section 5
@@ -268,74 +301,18 @@ Defects found after the slices were approved. Each has a regression test.
 | 2026-10-22 | One payment could not be followed across Api, worker and callbacks; status changes and key decisions were not logged | Scopes carried only `PaymentId` and `TransactionId`; callbacks had no scope | Logging pass (section 8): shared property names, one line per transition, decision lines, turned-away callbacks at Warning, JSON console in Compose. The `Polly` category is `Critical` in the worker because its timeout event duplicates our own Warning (`acme-client-resilience`) | `SubmitTimeoutRttqApproved_LogsTheJourneyByPaymentIdAndNeverASecret` |
 | 2026-10-22 | The immediate RTTQ-404 resend was occasionally not claimable straight away (about 1 in 10 full integration runs) | Scheduled times were stamped with the worker's clock (`now + delay`) but claimed against Postgres `now()`, so any skew between the two clocks delayed or advanced a retry | The 429 and limiter releases, the RTTQ-404 resend and the RTTQ back-off now pass a delay and the database computes `now() + delay`; delays are unchanged, no schema change. The resend-window check still compares the worker clock with `first_sent_at` | `Reconcile_WhenTheAppClockIsAheadOfTheDatabase_TheImmediateResendIsStillClaimableAtOnce` |
 
-## 14. Production architecture (proposed, not built)
-
-This is how I would run the service in production. The local build covers the payment logic: leases, RTTQ reconciliation, idempotent callbacks and the shared rate limit. This section covers everything around it. None of it is built. Section 8 is the short version; this is the full target.
-
-### 14.1 Topology
-- **Accounts:** separate AWS accounts for dev, staging and prod. Prod is only reachable through the pipeline.
-- **Network:** one VPC across three AZs. Only the ALB and the NAT gateways are public. ECS tasks, RDS and Redis sit in private subnets, with a security group per tier. Calls to Acme leave through NAT on fixed elastic IPs, so Acme can allow-list them. VPC endpoints for ECR, S3, Secrets Manager and CloudWatch keep that traffic off the internet.
-- **Edge:** Route 53 in front of an ALB with AWS WAF (rate rules and the managed rule sets). TLS ends at the ALB with ACM certificates.
-- **Compute:** ECS Fargate. At least two Api tasks and two Worker tasks, spread across AZs. They run the same images as Compose, promoted by digest.
-- **Data:** RDS PostgreSQL, Multi-AZ, with automated backups and point-in-time recovery, behind RDS Proxy. Redis on ElastiCache with a replica and automatic failover.
-
-### 14.2 Security and compliance
-- **App callers:** the app API goes behind OIDC/JWT validation (API Gateway or ALB authentication) with scopes per caller. Today it has no caller auth.
-- **Acme callbacks:** keep Basic auth on advices and HMAC on webhooks. If Acme publishes its source IPs, add a WAF rule that limits the callback paths to them.
-- **Encryption:** KMS at rest for RDS, Redis, S3 and the logs. TLS everywhere in transit, including RDS (`sslmode=verify-full`) and Redis.
-- **Secrets:** Secrets Manager injects the Acme API key, advice credentials, webhook secret and database credentials. The database password rotates automatically. The Acme API key and HMAC secret rotate on a schedule, with an overlap window where old and new are both accepted.
-- **PCI scope:** we store card tokens only, never card numbers, which keeps us out of most cardholder-data scope. I would still confirm the scope statement and who owns it with whoever handles compliance. Logs never contain tokens, keys or bodies (`LoggingTests`).
-- **Least privilege:** one IAM task role per service, and separate database roles for the Api and the Worker. Nobody has DDL rights at runtime.
-- **Retention:** retention periods for emails and audit rows get agreed with privacy and finance. Old partitions are archived to S3 (encrypted, object lock) rather than deleted, which fits `no-lost-audit`.
-- **Detection:** CloudTrail, GuardDuty and AWS Config on the accounts, and image scanning in ECR.
-
-### 14.3 Reliability and disaster recovery
-- **Targets:** I would aim for an RPO of about 5 minutes (PITR) and an RTO of about an hour. These are my proposals and would need agreeing with the business. Multi-AZ covers losing an AZ, with a failover of a minute or two.
-- **Failure behaviour is already designed in.** A Postgres failover or a killed worker leaves leases that expire, and RTTQ resolves them without a resend. Losing Redis pauses outbound calls and loses no data. An Acme outage opens the breaker and payments wait in `Pending`.
-- **Regional DR:** cross-region backups, and infrastructure as code that can be deployed to a second region. A restore drill every quarter, with the result written down.
-- **Migrations:** a one-off ECS task in the pipeline, run before the new version rolls out, instead of at Api startup, where several replicas would race. Additive changes first, then backfill, then constrain. Indexes built `CONCURRENTLY`.
-- **Deploys:** rolling or blue/green, with health checks and automatic rollback on a failed check or alarm. The `stopTimeout` stays above the worker's Acme timeout plus 15 s (at least 55 s).
-
-### 14.4 Delivery and operations
-- **Pipeline:** build, format check, unit and integration tests, dependency and image scan, push to ECR, deploy to staging, run a smoke test script, manual approval, deploy to prod, roll back on alarm. Staging talks to the Acme sandbox.
-- **Infrastructure as code:** Terraform or CDK for all of the above, with plan review and drift detection.
-- **Observability:** JSON logs to CloudWatch Logs with a retention period set. Metric filters on the `ALERT` and Warning lines first, then EMF custom metrics with low-cardinality dimensions only. OpenTelemetry traces to X-Ray with `PaymentId` as an attribute, never a metric dimension. One dashboard per service.
-- **SLOs and alarms (SNS to on-call):**
-  - Most payments reach a final state within a couple of minutes, and every payment either gets there inside the resend window or is flagged.
-  - Flagged (`needs_investigation`) payments above zero.
-  - Age of the oldest `Pending`, `Submitted` or `Unknown` payment.
-  - Acme 429s, limiter denials, breaker open, 401 from Acme.
-  - Unmatched webhooks waiting, and sweep give-ups.
-  - Callback rejections, ALB 5xx, RDS CPU, connections and storage, Redis availability.
-- **Runbooks:** one per `ALERT` line (conflicting outcomes, `AuthAmount` above `Amount`, resend exhausted, sweep give-up, Acme 401). Each says what it means, how to check what Acme has (RTTQ or the portal) and who decides the outcome. The design hands these cases to a person, so the runbooks are part of the system.
-- **Finance reconciliation:** a daily job compares our summary with Acme's settlement files and reports any difference. It is the independent check that our totals are right.
-
-### 14.5 Scale and capacity
-- Acme's 20 requests per second (POST and RTTQ together) is the ceiling. At the default of 15 per second that is roughly 15 submissions a second, about 1.3 million a day if there is no RTTQ traffic. Postgres handles that easily.
-- Workers scale on the age of the oldest `Pending` payment. More workers can't exceed the Acme budget, because it lives in Redis. The sweep runs under an advisory lock, so extra workers don't double-count attempts.
-- The Api scales on CPU and request count. RDS Proxy keeps connections under the Postgres limit as tasks grow (the code caps the pool at 40 per process).
-- **When I would change the design:** if latency matters more than the poll interval, or Acme raises its limit, I would move dispatch to SQS (written by the outcome path, with Postgres still the source of truth) and add paced dispatch (section 12). If the summary gets slow, a reader replica or a materialised table.
-
-### 14.6 Known risks in the current build
+## 14. Known risks and follow-ups
+**Risks in the current build**
 - Dispatch is polling on Postgres, so there is up to one poll interval of delay (500 ms by default).
-- Two reads still use the app clock: the resend-window check and the Retry-After date parse (see Known follow-ups).
-- The code has no metrics exporter, no caller auth and no TLS. 14.1 and 14.2 cover those.
+- The code has no metrics exporter, no caller auth and no TLS. Section 8 covers how I would add them.
 - Redis is a single point for the rate window. Losing it pauses calls but loses no payments.
 - Not verified: the medium simulation, an idle-timeout test for pooled connections, and the manual hard-kill and callback checks, which aren't automated.
 
-### 14.7 What I would do differently
-- Write the lease-ownership and multi-worker tests when I introduced leases, not after review.
-- Test for app-clock against database-clock mixing from the start. It caused the one flaky test.
-- Keep the Compose smoke test as a script in the repo, not a manual procedure.
-- Run that smoke test every slice, not once at the end.
-- Run migrations as a pipeline step from day one.
-
-## 15. Known follow-ups
-Deferred on purpose; none changes the behaviour described above, and PR #1 lists them too.
+**Follow-ups (deferred on purpose; none changes the behaviour described above, and PR #1 lists them too)**
 - **App-clock reads (two left).** The resend-window check (`now - FirstSentAt <= ResendWindow`, `ReconciliationService`) compares the database-written `first_sent_at` with the app clock; a few ms of skew is harmless against a 10-minute window, but it could move to SQL for consistency. The `Retry-After` HTTP-date parse in `AcmeClient` uses the app clock against Acme's header; that is outside our control, and `Retry-After` is usually given in seconds.
 - **Five lower-priority review points from PR #1:**
   1. A contradicting late webhook can log the `ALERT` twice.
   2. The sweep's scope (webhooks only, not advices) is not stated consistently across the docs.
-  3. The scope wording in this document and a stale caveat in `ai/spec-conformance.md`.
+  3. The scope wording in this document (the sweep adopts webhooks only; the section 3 and section 13 wording should say so everywhere).
   4. An extra advice lookup on the callback path.
   5. The `V1_06` index is created without `CONCURRENTLY`, which matters on a large table.
