@@ -138,6 +138,43 @@ public sealed class UnmatchedWebhookSweepTests(PostgresFixture postgres) : IAsyn
     }
 
     [Fact]
+    public async Task Sweep_WhenTwoWorkersSweepAtOnce_CountsOneAttemptAndAlertsOnce()
+    {
+        await SendWebhookAsync(Webhook("u-1", "Reversal", LateRrn, 10_000));
+        var settings = ReconciliationSettings.Default with { UnmatchedMaxAttempts = 1 };
+        using var first = new WorkerHarness(_connectionString, _stub, reconciliation: settings);
+        using var second = new WorkerHarness(_connectionString, _stub, reconciliation: settings);
+
+        await Task.WhenAll(
+            Task.Run(() => first.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None)),
+            Task.Run(() => second.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None)));
+
+        (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps WHERE attempts = 1 AND exhausted_at IS NOT NULL")).ShouldBe(1);
+        (first.Logs.All + second.Logs.All).Split("ALERT unmatched webhook").Length.ShouldBe(2);
+    }
+
+    [Fact]
+    public async Task Sweep_WhenAnotherWorkerHoldsTheLock_SkipsWithoutWaitingOrCountingAnAttempt()
+    {
+        await SendWebhookAsync(Webhook("u-1", "Reversal", LateRrn, 10_000));
+        using var harness = new WorkerHarness(_connectionString, _stub, minimumLevel: Microsoft.Extensions.Logging.LogLevel.Debug);
+        await using var holder = new NpgsqlConnection(_connectionString);
+        await holder.OpenAsync();
+        await using (var transaction = await holder.BeginTransactionAsync())
+        {
+            await holder.ExecuteAsync("SELECT pg_advisory_xact_lock(@key)", new { key = Payments.Infrastructure.Persistence.PostgresPaymentStore.UnmatchedSweepLockKey }, transaction);
+
+            (await harness.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None)).ShouldBe(0);
+
+            (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps")).ShouldBe(0);
+            harness.Logs.All.ShouldContain("sweep skipped: another worker");
+        }
+
+        await harness.Reconciliation.AdoptUnmatchedWebhooksAsync(CancellationToken.None);
+        (await CountAsync("SELECT count(*) FROM unmatched_event_sweeps WHERE attempts = 1")).ShouldBe(1);
+    }
+
+    [Fact]
     public async Task EventsTable_StillRejectsEditsOtherThanAdoption()
     {
         await SendWebhookAsync(Webhook("u-1", "Reversal", LateRrn, 10_000));

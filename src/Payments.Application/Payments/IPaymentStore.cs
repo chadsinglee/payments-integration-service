@@ -59,6 +59,12 @@ public interface IPaymentStore
     Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Runs one unmatched-event sweep pass only if no other worker is running one: a transaction-level advisory lock is tried
+    /// without waiting and held until the pass ends. Returns null (pass not run) when another worker holds it.
+    /// </summary>
+    Task<int?> TryRunUnmatchedSweepAsync(Func<CancellationToken, Task<int>> pass, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Attaches a stored unmatched event to its payment and recomputes the status, in one transaction under the payment's row lock
     /// (the same recompute as <see cref="ApplyEventAsync"/>). Skipped when the event was already adopted.
     /// </summary>

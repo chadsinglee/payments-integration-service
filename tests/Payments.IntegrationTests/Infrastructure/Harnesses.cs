@@ -51,7 +51,8 @@ public sealed class WorkerHarness : IDisposable
         ReconciliationSettings? reconciliation = null,
         AcmeGateSettings? gate = null,
         IAcmeRateLimiter? limiter = null,
-        string? apiKey = null)
+        string? apiKey = null,
+        LogLevel minimumLevel = LogLevel.Information)
     {
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -64,7 +65,7 @@ public sealed class WorkerHarness : IDisposable
             .Build();
 
         var services = new ServiceCollection();
-        services.AddLogging(logging => logging.AddProvider(Logs));
+        services.AddLogging(logging => logging.SetMinimumLevel(minimumLevel).AddProvider(Logs));
         services.AddSingleton<IConfiguration>(configuration);
         services.AddPaymentsApplication();
         services.AddPaymentSubmission();

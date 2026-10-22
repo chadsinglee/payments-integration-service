@@ -273,6 +273,29 @@ public sealed class PostgresPaymentStore(NpgsqlDataSource dataSource) : IPayment
             .ToList();
     }
 
+    /// <summary>Advisory-lock key for the unmatched-event sweep (one pass at a time across all workers).</summary>
+    public const long UnmatchedSweepLockKey = 7_301_002_001;
+
+    public async Task<int?> TryRunUnmatchedSweepAsync(Func<CancellationToken, Task<int>> pass, CancellationToken cancellationToken)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+        var acquired = await connection.ExecuteScalarAsync<bool>(new CommandDefinition(
+            "SELECT pg_try_advisory_xact_lock(@key)",
+            new { key = UnmatchedSweepLockKey },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (!acquired)
+        {
+            return null;
+        }
+
+        // The pass does its own database work on other connections; this transaction only owns the lock until it ends.
+        var result = await pass(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return result;
+    }
+
     public async Task RecordUnmatchedAttemptAsync(long eventId, bool exhausted, CancellationToken cancellationToken)
     {
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);

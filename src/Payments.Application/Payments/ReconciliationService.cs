@@ -45,6 +45,18 @@ public sealed class ReconciliationService(
     /// </summary>
     public async Task<int> AdoptUnmatchedWebhooksAsync(CancellationToken cancellationToken)
     {
+        var progressed = await store.TryRunUnmatchedSweepAsync(SweepUnmatchedAsync, cancellationToken);
+        if (progressed is null)
+        {
+            logger.LogDebug("Unmatched-event sweep skipped: another worker is running it");
+            return 0;
+        }
+
+        return progressed.Value;
+    }
+
+    private async Task<int> SweepUnmatchedAsync(CancellationToken cancellationToken)
+    {
         var due = await store.FindDueUnmatchedWebhooksAsync(SweepBatch, settings.BackoffBase, settings.BackoffCap, cancellationToken);
         if (due.Count > 0)
         {
