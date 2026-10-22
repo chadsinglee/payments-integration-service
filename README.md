@@ -11,6 +11,7 @@ curl -X POST http://localhost:5001/payments -H "Content-Type: application/json" 
 curl http://localhost:5001/payments/pay-1
 docker compose down -v
 ```
+The `curl` examples assume PowerShell 7 or a bash shell (in Windows PowerShell 5.1, `curl` is an alias for `Invoke-WebRequest`).
 Compose uses throwaway local defaults (override with `POSTGRES_PASSWORD`, `ACME_API_KEY`, `ACME_MERCHANT_ID`, `SEED_DEMO_DATA`). Redis holds the shared Acme rate limit (the worker pauses, and calls nothing, while Redis is down). Outside Compose, configuration is environment-only (never committed):
 
 | Variable | Host | Notes |

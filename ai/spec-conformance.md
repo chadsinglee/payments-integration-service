@@ -40,7 +40,7 @@ Produced by an independent read-only review of `docs/spec.md` against `SOLUTION.
 | D3 | AI config in tool-expected locations | met | `AGENTS.md`, `.github/` committed on branch `feature/payments-submission` |
 | D4 | `ai/` directory | met | plan, sessions, this file |
 | D5 | Exported Acme-client sessions | met, with limits | `ai/transcripts/` holds redacted, mechanically converted transcripts of the whole build session, bootstrap and slices 1-9 plus the close-out (full prompts, answers, assistant text, tool calls and results, see `ai/transcripts/README.md`). `ai/sessions/` holds curated summaries for slices 6-9 only; slices 1-5 have no curated summary, their transcripts are the record. Limits: tool output and arguments over 4000 characters are cut, hidden reasoning and system prompts are not included, and the turn that wrote the export is not in it. The checkpoint summaries are not part of the record |
-| D6 | Single GitHub repository | met, with limits | branch `feature/payments-submission` is pushed to `chadsinglee/payments-integration-service`; the remote has no `main` yet, so no pull request exists |
+| D6 | Single GitHub repository | met | the work is in `chadsinglee/payments-integration-service`; PR #1 was merged into `main` with a regular merge commit |
 | D7 | 5-10 minute video | missing | owner: user |
 | D8 | Personal info removed from sessions | unverifiable | records written without names or paths |
 
