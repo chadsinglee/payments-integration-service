@@ -2,7 +2,7 @@
 
 A .NET 8 service that lets the Zapper app submit and track card payments through the PSP Acme Pay (stored card tokens, facilitator sub-merchants). It processes Acme's Payment Advice notifications and Transaction Status webhooks safely (duplicates, out-of-order, late reversals/refunds) and produces a daily per-sub-merchant settlement summary. An Acme stub, a Postgres database and a Redis rate limiter run alongside it in Docker Compose.
 
-> Status: complete (all nine slices built and verified); see [`SOLUTION.md`](SOLUTION.md) for design and the deliverables checklist.
+> Status: complete (all nine slices built and verified); post-slice fixes are listed in [`SOLUTION.md` §13](SOLUTION.md#13-fixes-after-delivery), and known follow-ups in §15. See `SOLUTION.md` for design and the deliverables checklist.
 
 ## Run locally
 ```powershell
@@ -42,6 +42,8 @@ Seed data (`Database__SeedDemoData=true`): customers `cust-001`, `cust-002`; sub
 - Logs: `docker compose logs -f worker api`. Payment processing lines carry `PaymentId` and `TransactionId`. API keys, card tokens, emails and connection strings are never logged.
 - Shutdown: `docker compose stop worker` lets an in-flight Acme call finish and be recorded (host timeout = Acme timeout + 15 s, `stop_grace_period: 60s`). A hard kill is recovered through lease expiry and RTTQ.
 - Reset: `docker compose down -v`.
+- Acme call timing: set `ACME_GATE_LOG_LEVEL=Debug` (default `Information`) before `docker compose up` to log, for every Acme call, how many ms passed between Redis granting its rate-limit token and the call being dispatched. It is per-call detail, so noisy; use it only to diagnose rate-limit timing.
+- Smoke test: the Compose smoke test (approve, decline, 429 retry, summary, callbacks, graceful stop, hard kill) is a manual procedure; there is no script in the repo.
 
 ## Build and test
 See the Commands table in [`AGENTS.md`](AGENTS.md) (unit tests need no infrastructure; integration tests need Docker).
@@ -49,5 +51,5 @@ See the Commands table in [`AGENTS.md`](AGENTS.md) (unit tests need no infrastru
 ## Documents
 - [`docs/spec.md`](docs/spec.md): the authoritative specification
 - [`SOLUTION.md`](SOLUTION.md): design, decisions, domain constraints, diagram, deliverables checklist
-- [`ai/`](ai/): AI workflow artifacts (plans, prompts, review notes)
+- [`ai/`](ai/): AI workflow artifacts (plans, prompts, review notes). The session transcripts in `ai/transcripts/` end on 2026-10-21 at 10:20; the later work (logging pass, `AuthAmount` guard, sweep lock, flaky-test investigation, SQL-side scheduling, PR review) is covered in `ai/sessions/post-slice-hardening.md`.
 - [`docs/ai-template.md`](docs/ai-template.md): the AI repo-starter template this repo was bootstrapped from
